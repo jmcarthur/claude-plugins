@@ -6,6 +6,8 @@ checks each cause before it goes deeper. A live graph in your browser shows what
 it found. A rule such as "find the cause first" in `CLAUDE.md` is easy to skip;
 rootcause raises it when a bug appears and keeps a record you can read.
 
+![An analysis in the web UI: the symptom at the top, its causes as a graph below, a ruled-out cause struck through, the two fixes marked, and the conclusion in a panel on the right](docs/media/analysis.png)
+
 ## Install
 
 ```

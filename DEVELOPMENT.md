@@ -66,6 +66,11 @@ npx prettier --check .
   python3 -c 'import collections, glob, json, os; print(collections.Counter(json.load(open(f))["status"] for f in glob.glob(os.path.expanduser("~/.claude/rootcause/analyses/*.json"))))'
   ```
 
+- The README's screenshot, `rootcause/docs/media/analysis.png`, comes from
+  `python3 -I rootcause/docs/media/screenshot.py`. It records a made-up analysis
+  in a scratch `ROOTCAUSE_DIR`, serves it on a spare port, and has headless
+  Chrome take the picture. Take it again after a change to how the page draws.
+
 ## runway and tidy
 
 - Each ships alone, so each has its own copy of the small helpers (logging,
