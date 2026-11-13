@@ -1,0 +1,29 @@
+{
+  "name": "jmcarthur",
+  "owner": {
+    "name": "jmcarthur"
+  },
+  "description": "Plugins for Claude Code: rootcause, runway, threads and tidy.",
+  "plugins": [
+    {
+      "name": "rootcause",
+      "source": "./rootcause",
+      "description": "A subagent that finds the root causes of a defect one question at a time, before the session fixes it."
+    },
+    {
+      "name": "runway",
+      "source": "./runway",
+      "description": "Switches subscriptions with claude-swap before a usage limit stops the work, resumes a session that a limit stopped, and, with tidy, suggests compacting before a long limit."
+    },
+    {
+      "name": "threads",
+      "source": "./threads",
+      "description": "Keeps a session's lines of thought as threads, each with its history and the questions waiting on you, in a pane beside the chat."
+    },
+    {
+      "name": "tidy",
+      "source": "./tidy",
+      "description": "Gives the model a tool to compact its own context, suggests compacting at boundaries, and keeps the prompt cache warm while background work runs."
+    }
+  ]
+}

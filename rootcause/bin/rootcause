@@ -1,0 +1,1688 @@
+#!/usr/bin/env python3
+"""Find the root causes of a defect, one level of causes at a time.
+
+  rootcause start            symptom: ...  (one line per symptom)
+  rootcause add-symptom ID   symptom: ...
+  rootcause answer ID        [step: 1.2] [combine: all|any|parts] [coverage: ...] ENTRY...
+  rootcause check ID
+  rootcause conclude ID      leftAlone: 1.1 / reason: ...  (one per branch end)
+  rootcause abandon ID       reason: ...
+  rootcause list             [--stale]
+  rootcause serve            [--detach] [--session ID [--claim ID] [--if-known]]
+
+The input is "key: value" lines. An ENTRY starts with a cause line, followed
+by evidence, status, effects (one line each, or effects: none) and reach, with
+fix, change, proportion and hideReason when reach is fix, and an optional weight; or
+it is one line, same: 1.2, for a cause already in the analysis at that step.
+A line evidence E1: ... anywhere in an answer defines evidence E1 once for the
+analysis, and a cause cites it with cites: E1, E2, with or without its own
+evidence line. A supported cause also gives proof and unprovable.
+Several symptom lines start an analysis of symptoms that may share causes: the
+first symptom's steps are numbered 1, 1.2, a later symptom is S2 and its steps
+S2.1, S2.1.2, and a same may name a step of another symptom.
+An indented line continues the value above it. The same input as one JSON
+object also works: {"causes": [{"cause": ..., "effects": [...]}], ...}.
+
+Each command but check, list and serve reads its input on stdin. The reply goes to stdout
+and ends with the next question; a refusal goes to stderr, restates the open
+question, and exits 1. Analyses are kept in ROOTCAUSE_DIR/analyses, by default
+~/.claude/rootcause/analyses, one JSON file each.
+
+serve runs the web UI on http://127.0.0.1:ROOTCAUSE_PORT (default 7391). The
+plugin's hooks module runs it; see docs/reference.md.
+"""
+import argparse
+import contextlib
+import copy
+import datetime
+import errno
+import fcntl
+import http.server
+import json
+import os
+import pathlib
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+
+STATUSES = ('checked', 'supported', 'hypothesis', 'refuted')
+
+REACHES = ('changeable', 'fix', 'design', 'outside', 'decision', 'needed', 'stop')
+
+VERDICTS = ('keep', 'change')
+
+COMBINES = ('all', 'any', 'parts')
+
+FIXES = ('removes', 'removes-and-guards', 'hides')
+
+DESIGN = 'For design, ask why it works this way: give purpose, what the design was for and whether that still holds, and verdict: change, with fix, change and proportion as for reach fix, if a different design would serve the purpose without this cause (the walk then asks why it was designed so), or keep, with keepReason, if the purpose outweighs this symptom and the other defects of its kind (this ends the branch). Weigh proportion against every defect the design causes, not only this one, and count a cause that has come back as evidence against the design.'
+
+REACH = 'Reach: changeable (you can change it and its causes are worth walking), fix (you would change it here; give fix: removes, removes-and-guards or hides, change: what you would change, proportion: why the change is in proportion to the effects it removes, and hideReason with hides; its causes are still walked), design (the code works as it was designed, by an earlier session or author, and the design itself may be the mistake), outside (outside your reach), decision (a choice the user made or asked for; a design they did not ask for is design), needed (in combine: parts only, a part that is what its purpose needs), or stop (you could change it but leave it alone: the change is out of proportion to what it removes, no deeper cause is worth naming, or you cannot tell the deeper cause). A branch ends only at outside, decision, needed, stop or a kept design, never at a fix; at conclude, give each end a reason in leftAlone. ' + DESIGN
+
+PARTS = 'When what you explain is made of parts that each make some of it (slices of a time or a size, groups of failures, wrong pieces of an output, points of a correction), give combine: parts, and coverage: how the parts together make up all of it, such as what they add up to against the whole. Give each part share: how much of the whole it makes, and need: what the part would be if it were right, worked out from the purpose and not from the current code. A part whose need is what it is gets reach needed. Every part must be walked to its end and settled on its own, whatever a fix elsewhere removes.'
+
+SUPPORTED = 'A supported cause cites at least one evidence item, and gives proof: the check that would prove it, and unprovable: why that check cannot be run, such as that the data it needs is gone, the event cannot be reproduced, or it needs access you do not have. That it would take long or is hard is not a reason: run it, or start a helper to run it. A supported cause has reach changeable: it never ends a branch, and is never fixed.'
+
+UNFIXABLE = 'A supported cause cannot be fixed: you cannot fix what you cannot measure. Fix a checked cause below it. If what keeps it from being checked is missing logging or instrumentation, that is a checked cause of its own, and you can fix it.'
+
+NO_LEAF = 'A supported cause cannot end a branch: its support rests on evidence, so the walk goes on below it. Give reach changeable, and give its causes.'
+
+CITES = 'A fact that backs several causes is given once, as an evidence E1: line, and each cause cites it with cites: E1, E2, with or without its own evidence.'
+
+WHY = f'Give every cause you find, each with its evidence, whether you checked it, what else it affects (look at callers and other uses), and whether you can change it; say whether all are needed together, any one is enough, or each makes part of it. Answer with a cause line for each cause, followed by its evidence, status, effects and reach, or a same line for a cause already given, and with combine when there is more than one. {PARTS} Status: checked if you saw the evidence yourself, supported if evidence backs it but the check that would prove it cannot be run (give proof and unprovable), hypothesis if you infer it, refuted if a check ruled it out. {CITES} {REACH}'
+
+DECISION = "Could this decision be the mistake? If it may be, say so. If it is the user's, including something they asked for, ask them before you build around it."
+
+HIDES = 'A guard, retry, special case or longer timeout that hides a cause you could fix is not a fix. Remove the cause as well (fix removes-and-guards), or give hideReason: why the cause cannot be removed, or that the user agreed.'
+
+AVOIDABLE = 'Then ask how it happened, and whether it could have been avoided if things were different: a design, interface, tool, missing check or process that made this defect easy to make or slow to find, or made the correct change costly so that a shortcut was likely, even where it is not a cause. Give an avoidable line for each, with avoid: the change that would prevent defects of this kind, worth: yes or no, and why: its cost against the defects of this kind it would prevent. Name a change to the code, tools or process, not that someone should have been more careful. Or give avoidable: none.'
+
+ENDINGS = {'outside': 'Ends outside reach.', 'decision': 'Ends at a deliberate decision.', 'needed': 'Its purpose needs it as it is.'}
+
+ASK = 'Why does this happen, or, for a fact about the project or its history, why is it like this?'
+
+ASK_MORE = {
+    'changeable': 'And why does that happen, or why is it like this? If a past decision explains it, why was that decision made?',
+    'fix': 'You would fix it here, but that does not end the questions. Why does that happen, or why is it like this? If a past decision explains it, why was that decision made?',
+    'design': 'You would change this design. Why was it designed so in the first place? Rethinking that decision may be the deeper fix.',
+}
+
+HISTORY = 'Answer why a decision was made only from the record: comments, docs, version control history, the issue tracker, and only as a last resort the session transcripts. Do not invent a motive. A decision the user made is reach decision. If you cannot tell a cause, end the branch there with reach stop.'
+
+LEFT_ALONE = 'For a stop, the reason names the deeper change you considered and why it is out of proportion, or says you cannot tell the deeper cause and what you searched and what it showed. A reason that names no alternative, or a cannot-tell with nothing tried, means you did not look.'
+
+COMBINED = {'all': 'all needed together', 'any': 'any one is enough', 'parts': 'each makes part of it'}
+
+STEP = re.compile(r'[1-9]\d*(\.[1-9]\d*)*')
+
+SYMPTOM = re.compile(r'[Ss]([1-9]\d*)')
+
+
+class Refusal(Exception):
+    pass
+
+
+# An analysis has one or more symptoms. The first is the record's own symptom
+# and why, as in a record with a single symptom; each later one is in
+# moreSymptoms. A path is the symptom's index, then the index of each cause
+# down to the step. The first symptom's steps are numbered 1, 1.2, 1.2.1, so a
+# record with one symptom reads the same as one with several, and adding a
+# symptom renumbers nothing; a later symptom is S2, S3, and its steps S2.1,
+# S2.1.2.
+def symptoms(a):
+    return [a, *a.get('moreSymptoms', [])]
+
+
+def is_multi(a):
+    return bool(a.get('moreSymptoms'))
+
+
+def root_of(a, k):
+    found = symptoms(a)
+    return found[k] if 0 <= k < len(found) else None
+
+
+def label(path):
+    k, steps = path[0], '.'.join(str(i + 1) for i in path[1:])
+    if k == 0 and steps:
+        return steps
+    return f'S{k + 1}' + (f'.{steps}' if steps else '')
+
+
+def owner(a, path):
+    if len(path) > 1:
+        return f'step {label(path)}'
+    return f'symptom {label(path)}' if is_multi(a) else 'the symptom'
+
+
+def parse_path(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        s = str(int(value)) if float(value).is_integer() else str(value)
+    elif isinstance(value, str):
+        s = value.strip()
+    else:
+        return None
+    if s == '0':
+        return (0,)
+    head, dot, rest = s.partition('.')
+    m = SYMPTOM.fullmatch(head)
+    k = 0 if m is None else int(m.group(1)) - 1
+    if m is not None:
+        if not dot:
+            return (k,)
+        s = rest
+    return (k, *(int(n) - 1 for n in s.split('.'))) if STEP.fullmatch(s) else None
+
+
+def cause_at(a, path):
+    holder = root_of(a, path[0])
+    group, cause = holder and holder.get('why'), None
+    for i in path[1:]:
+        if group is None or i >= len(group['causes']):
+            return None
+        cause = group['causes'][i]
+        group = cause.get('why')
+    return cause
+
+
+def group_at(a, path):
+    if len(path) == 1:
+        holder = root_of(a, path[0])
+        return holder and holder.get('why')
+    cause = cause_at(a, path)
+    return cause and cause.get('why')
+
+
+def with_group(a, path, group):
+    if len(path) > 1:
+        cause_at(a, path)['why'] = group
+    else:
+        root_of(a, path[0])['why'] = group
+
+
+def is_live(c):
+    return 'same' not in c and c['status'] != 'refuted'
+
+
+def counted(c):
+    return 'same' in c or c['status'] != 'refuted'
+
+
+def several(causes):
+    return sum(1 for c in causes if counted(c)) > 1
+
+
+def nodes_in(group, base):
+    for i, c in enumerate(group['causes']):
+        yield (*base, i), c
+        if 'why' in c:
+            yield from nodes_in(c['why'], (*base, i))
+
+
+def nodes(a):
+    for k, holder in enumerate(symptoms(a)):
+        if 'why' in holder:
+            yield from nodes_in(holder['why'], (k,))
+
+
+# Depth first, so that each branch is walked to its end before the next one
+# starts, and a cause added anywhere is asked about at its place in that order.
+def open_in(group, base):
+    if not any(counted(c) for c in group['causes']):
+        return 'why', base
+    for i, c in enumerate(group['causes']):
+        path = (*base, i)
+        if not is_live(c):
+            continue
+        if c['status'] == 'hypothesis':
+            return 'check', path
+        if not walks(c):
+            continue
+        inner = ('why', path) if 'why' not in c else open_in(c['why'], path)
+        if inner:
+            return inner
+    return None
+
+
+# Each symptom is walked to its end before the next.
+def open_of(a):
+    for k, holder in enumerate(symptoms(a)):
+        found = ('why', (k,)) if 'why' not in holder else open_in(holder['why'], (k,))
+        if found:
+            return found
+    return 'conclude', None
+
+
+def every(a):
+    return 'every symptom' if is_multi(a) else 'the symptom'
+
+
+def prompt(a):
+    question, path = open_of(a)
+    if question == 'conclude':
+        return conclusion_prompt(a)
+    ruled_out = f'Every cause given for {owner(a, path)} was ruled out. ' if group_at(a, path) is not None else ''
+    if len(path) == 1:
+        at = f"{a['id']} symptom {label(path)}: {sentence(root_of(a, path[0])['symptom'])}" if is_multi(a) else f"{a['id']}."
+        return f"{at} {ruled_out}{ASK} {WHY}"
+    c = cause_at(a, path)
+    at = f"{a['id']} step {label(path)}: {sentence(c['cause'])}"
+    if question == 'why':
+        return f"{at} {ruled_out}{ASK_MORE[c['reach']]} {HISTORY} {WHY}"
+    return f'{at} How would you check it? Check it, then give the causes of {owner(a, path[:-1])} again with this one marked checked, or refuted, and what the check showed as its evidence, or revise it. Only if no check that would prove it can be run, mark it supported, with the evidence that backs it. {SUPPORTED}'
+
+
+def conclusion_prompt(a):
+    gap = gap_of(a)
+    if gap is not None:
+        return f"{a['id']}: every branch has ended, but the fixes do not settle {every(a)}. {gap} To add a fix, give the causes of a step again with step, and reach fix on the cause to fix."
+    ends = ', '.join(label(end) for end in branch_ends(a))
+    return f"{a['id']}: every branch has ended, and the fixes cover {every(a)}. {weak_note(a)}Run rootcause conclude with leftAlone: {f'the reason you leave each branch end alone: {ends}. {LEFT_ALONE}' if ends else 'none.'} {AVOIDABLE}"
+
+
+def text(value):
+    return value.strip() if isinstance(value, str) and value.strip() != '' else None
+
+
+# A cause's support is as weak as the unproven links on its path from the
+# symptom: the supported causes above it, and itself.
+def unproven(a, path):
+    return [label(path[:i]) for i in range(2, len(path) + 1) if cause_at(a, path[:i]).get('status') == 'supported']
+
+
+def links_text(links):
+    return f"{len(links)} unproven {'link' if len(links) == 1 else 'links'}: {', '.join(links)}"
+
+
+def rests_on(links):
+    return f'Rests on {links_text(links)}.' if links else ''
+
+
+def weak_fixes(a):
+    return [(at, unproven(a, at)) for at, c in nodes(a) if is_live(c) and is_fix(c) and unproven(a, at)]
+
+
+def weak_note(a):
+    weak = weak_fixes(a)
+    if not weak:
+        return ''
+    return ' '.join(f'The fix at {label(at)} rests on {links_text(links)}.' for at, links in weak) + ' Say so in your report. '
+
+
+EVIDENCE_ID = re.compile(r'E[1-9]\d*')
+
+# A reason that names only the effort of a check is no reason it cannot run.
+EFFORT = re.compile(r"\b(too (long|slow|hard|costly|expensive|much (time|work|effort))|takes? (too )?long|time-consuming|tedious|not worth (it|the (time|effort)))\b", re.I)
+
+
+def unprovable_of(a, at, value):
+    reason = text(value)
+    if reason is None or len(reason.split()) < 4:
+        raise refused(a, f'{at} give unprovable: why the check that would prove it cannot be run, in a sentence. {SUPPORTED}')
+    if EFFORT.search(reason):
+        raise refused(a, f'{at} unprovable names only the effort of the check. {SUPPORTED}')
+    return reason
+
+
+def cites_of(a, at, value):
+    items = re.split(r'[,\s]+', value.strip()) if isinstance(value, str) else as_list(value)
+    if items is None or not all(isinstance(i, str) for i in items):
+        raise refused(a, f'{at} give cites as evidence ids, such as cites: E1, E2.')
+    ids = list(dict.fromkeys(i.strip().upper() for i in items if i.strip() != ''))
+    known = {e['id'] for e in a.get('evidenceItems', [])}
+    for i in ids:
+        if not EVIDENCE_ID.fullmatch(i):
+            raise refused(a, f'{at} give cites as evidence ids, such as cites: E1, E2.')
+        if i not in known:
+            raise refused(a, f'{at} cites {i}, which is not defined. Define it with an evidence {i}: line. {CITES}')
+    return ids
+
+
+# Evidence items are defined once per analysis, and an answer may give one
+# again as it was.
+def with_evidence(a, value, at):
+    items = records(value) if value is not None else []
+    if items is None:
+        raise refused(a, f'Give evidence items as evidence E1: lines. {CITES}')
+    known = {e['id']: e for e in a.get('evidenceItems', [])}
+    seen = set()
+    for r in items:
+        id, body = r.get('id'), text(r.get('text'))
+        id = id.strip().upper() if isinstance(id, str) else id
+        if not isinstance(id, str) or not EVIDENCE_ID.fullmatch(id) or body is None:
+            raise refused(a, f'Give each evidence item as evidence E1: what you ran or read and what it showed. {CITES}')
+        if id in seen:
+            raise refused(a, f'Evidence {id} is given twice.')
+        seen.add(id)
+        if id in known:
+            if known[id]['text'] != body:
+                raise refused(a, f'Evidence {id} is already defined as: {sentence(known[id]["text"])} Give a new id for a different fact.')
+            continue
+        a.setdefault('evidenceItems', []).append({'id': id, 'text': body, 'added': at})
+
+
+# Models sometimes send a list as its JSON text.
+def as_list(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value if isinstance(value, list) else None
+
+
+def texts(value):
+    items = as_list(value)
+    if items is None or not all(isinstance(item, str) for item in items):
+        return None
+    return [item.strip() for item in items if item.strip() != '']
+
+
+def records(value):
+    items = as_list(value)
+    return items if items is not None and all(isinstance(item, dict) for item in items) else None
+
+
+def one_of(options, value):
+    return value if isinstance(value, str) and value in options else None
+
+
+def sentence(s):
+    return s if re.search(r'[.!?]$', s) else f'{s}.'
+
+
+def refused(a, why):
+    return Refusal(f'{why} {prompt(a)}')
+
+
+def symptoms_of(input):
+    value = input['symptoms'] if 'symptoms' in input else input.get('symptom')
+    if isinstance(value, str) and not value.lstrip().startswith('['):
+        return [value.strip()] if value.strip() != '' else []
+    return texts(value) or []
+
+
+def numbered(ks):
+    return ', '.join(label((k,)) for k in ks)
+
+
+def new_analysis(id, input, at=None):
+    found = symptoms_of(input)
+    if not found:
+        raise Refusal('Give symptom: what behaves wrongly, as it was observed.')
+    if len(set(found)) < len(found):
+        raise Refusal('Give each symptom once.')
+    if len(found) == 1:
+        return {'id': id, 'symptom': found[0]}, f'Started {id}. {ASK} {WHY}'
+    at = at or now()
+    a = {'id': id, 'symptom': found[0], 'moreSymptoms': [{'symptom': s, 'added': at} for s in found[1:]]}
+    return a, f'Started {id}. Symptoms {numbered(range(len(found)))}: the steps of S1 are numbered 1, 1.2, and those of S2 S2.1, S2.1.2. The walk takes each symptom in turn, and a same line may name a step of another symptom. {prompt(a)}'
+
+
+def add_symptom(given, input, at=None):
+    a = copy.deepcopy(given)
+    found = symptoms_of(input)
+    if not found:
+        raise refused(a, 'Give symptom: the symptom to add, as it was observed.')
+    known = [h['symptom'] for h in symptoms(a)]
+    if len(set(found)) < len(found) or any(s in known for s in found):
+        raise refused(a, f'Give each symptom once. Already in the analysis: {"; ".join(f"{label((k,))} {sentence(s)}" for k, s in enumerate(known))}')
+    first = len(known)
+    a.setdefault('moreSymptoms', []).extend({'symptom': s, 'added': at or now()} for s in found)
+    names = numbered(range(first, first + len(found)))
+    return a, f"Added {'symptom' if len(found) == 1 else 'symptoms'} {names} to {a['id']}. {'Its steps are' if len(found) == 1 else 'Their steps are'} {', '.join(label((k, 0)) for k in range(first, first + len(found)))} and so on; the steps already given keep their numbers. The walk takes each symptom in turn, and a same line may name a step of another symptom. {prompt(a)}"
+
+
+def answer(given, input, at=None):
+    a = copy.deepcopy(given)
+    at = at or now()
+    if 'causes' not in input:
+        raise refused(a, 'Give causes: the causes of the step the question asks about.')
+    path = target_of(a, input)
+    with_evidence(a, input.get('evidenceItems'), at)
+    before = group_at(a, path)
+    entries = entries_of(a, path, input['causes'])
+    keys = [key_of(c) for c in entries]
+    if len(set(keys)) < len(keys):
+        raise refused(a, 'Give each cause once.')
+    combine = 'parts' if input.get('combine') == 'parts' else 'all' if not several(entries) else one_of(COMBINES, input.get('combine'))
+    if combine is None:
+        raise refused(a, 'Give combine: all if the causes are needed together, any if each is enough alone, parts if each makes part of it.')
+    group = {'combine': combine}
+    if combine == 'parts':
+        coverage = text(input.get('coverage'))
+        if coverage is None:
+            raise refused(a, f'With combine: parts, give coverage: how the parts together make up all of {owner(a, path)}. {PARTS}')
+        group['coverage'] = coverage
+    parts_of(a, entries, combine)
+    olds = {key_of(o): o for o in before['causes']} if before else {}
+    merged = [merge(olds.get(key_of(c)), c, at) for c in entries]
+    moves = renumbering(before, merged, path)
+    with_group(a, path, {**group, 'causes': merged})
+    dangling = renumber(a, moves)
+    if dangling is not None:
+        raise refused(given, f'Step {dangling[0]} is named by same at step {dangling[1]}, and this answer drops it or rules it out. Keep it, or change step {dangling[1]} first.')
+    replies = [recorded(a, path, combine, merged), decisions(path, merged), change_note(a, before, merged, path), prompt(a)]
+    return a, ' '.join(part for part in replies if part != '')
+
+
+def key_of(c):
+    return c['cause'] if 'cause' in c else f"same {c['same']}"
+
+
+# Each cause keeps when it was added, across the revisions that keep it, and
+# when its entry last changed, so that the web UI can show the walk's order.
+# A record without these times has neither, and a cause it keeps gets none.
+STAMPS = ('added', 'revised', 'why')
+
+
+def merge(old, new, at):
+    kept = {**new, 'why': old['why']} if old is not None and 'why' in old and walks(new) else dict(new)
+    if old is None:
+        return {**kept, 'added': at, 'revised': at}
+    unchanged = {k: v for k, v in old.items() if k not in STAMPS} == new
+    stamps = {'added': old.get('added'), 'revised': old.get('revised') if unchanged else at}
+    return {**kept, **{k: v for k, v in stamps.items() if v is not None}}
+
+
+def parts_of(a, entries, combine):
+    for i, c in enumerate(entries):
+        at = f'Part {i + 1}:' if combine == 'parts' else f'Cause {i + 1}:'
+        if c.get('reach') == 'needed' and combine != 'parts':
+            raise refused(a, f'{at} reach needed is for a part, under combine: parts.')
+        if combine != 'parts' or not is_live(c):
+            continue
+        if 'share' not in c or 'need' not in c:
+            raise refused(a, f'{at} give share: how much of the whole it makes, and need: what it would be if it were right, from the purpose. {PARTS}')
+
+
+def target_of(a, input):
+    if 'step' in input:
+        path = parse_path(input['step'])
+        if path is None:
+            raise refused(a, 'Give step as a number such as 1.2 or S2.1, or 0 or S2 for a symptom.' if is_multi(a) else 'Give step as a number such as 1.2, or 0 for the symptom.')
+        if len(path) == 1:
+            if root_of(a, path[0]) is None:
+                raise refused(a, f'Symptom {label(path)} is not in the analysis.')
+        else:
+            c = cause_at(a, path)
+            if c is None or not is_live(c) or not walks(c):
+                raise refused(a, f'Step {label(path)} ends its branch, so it takes no causes of its own.')
+        return path
+    question, path = open_of(a)
+    if question == 'conclude':
+        raise refused(a, 'Every branch has ended. To add a cause, give step: the step whose causes you give.')
+    return path if question == 'why' else path[:-1]
+
+
+def entries_of(a, path, value):
+    items = records(value)
+    if not items:
+        raise refused(a, 'Give causes: a cause line for each, followed by its evidence, status, effects and reach, or a same line.')
+    return [entry_of(a, path, (*path, i), r) for i, r in enumerate(items)]
+
+
+def entry_of(a, base, path, r):
+    at = f'Step {label(path)}:'
+    if 'same' in r:
+        return same_of(a, base, at, r['same'])
+    cause, evidence, status = text(r.get('cause')), text(r.get('evidence')), one_of(STATUSES, r.get('status'))
+    cites = cites_of(a, at, r['cites']) if 'cites' in r else []
+    if cause is None or (evidence is None and not cites):
+        raise refused(a, f'{at} give cause and evidence, or cites.')
+    if status is None:
+        raise refused(a, f'{at} give status: checked, supported, hypothesis or refuted.')
+    entry = {'cause': cause, **({} if evidence is None else {'evidence': evidence}), **({'cites': cites} if cites else {}), 'status': status}
+    if status == 'supported':
+        proof = text(r.get('proof'))
+        if proof is None:
+            raise refused(a, f'{at} with status supported, give proof: the check that would prove it. {SUPPORTED}')
+        entry.update(proof=proof, unprovable=unprovable_of(a, at, r.get('unprovable')))
+        if not cites:
+            raise refused(a, f'{at} with status supported, cite at least one evidence item with cites: E1. Inline evidence alone does not make a cause supported. {CITES}')
+    elif 'proof' in r or 'unprovable' in r:
+        raise refused(a, f'{at} proof and unprovable belong to a supported cause.')
+    if 'weight' in r:
+        weight = text(r['weight'])
+        if weight is None:
+            raise refused(a, f'{at} give weight as text, such as "5 of 7 passes", or leave it out.')
+        entry['weight'] = weight
+    for key in ('share', 'need'):
+        if key in r:
+            value = text(r[key])
+            if value is None:
+                raise refused(a, f'{at} give {key} as text. {PARTS}')
+            entry[key] = value
+    if status == 'refuted' or (status == 'hypothesis' and 'effects' not in r and 'reach' not in r):
+        return entry
+    effects = texts(r.get('effects'))
+    if effects is None:
+        raise refused(a, f'{at} give effects: what else this cause affects, one effects line each, or effects: none.')
+    reach = one_of(REACHES, r.get('reach'))
+    if reach is None:
+        raise refused(a, f'{at} give reach. {REACH}')
+    if status == 'supported' and (reach == 'fix' or (reach == 'design' and r.get('verdict') == 'change')):
+        raise refused(a, f'{at} {UNFIXABLE}')
+    if status == 'supported' and reach != 'changeable':
+        raise refused(a, f'{at} {NO_LEAF}')
+    entry.update(effects=effects, reach=reach)
+    if reach == 'fix':
+        entry.update(fix_of(a, at, r))
+    if reach == 'design':
+        entry.update(design_of(a, at, r))
+    return entry
+
+
+def design_of(a, at, r):
+    purpose, verdict, keep_reason = text(r.get('purpose')), one_of(VERDICTS, r.get('verdict')), text(r.get('keepReason'))
+    if purpose is None or verdict is None:
+        raise refused(a, f'{at} with reach design, give purpose and verdict. {DESIGN}')
+    if verdict == 'change':
+        return {'purpose': purpose, 'verdict': verdict, **fix_of(a, at, r)}
+    if keep_reason is None:
+        raise refused(a, f'{at} with verdict keep, give keepReason: why the purpose outweighs this symptom and the other defects of its kind.')
+    return {'purpose': purpose, 'verdict': verdict, 'keepReason': keep_reason}
+
+
+def is_fix(c):
+    return c.get('reach') == 'fix' or (c.get('reach') == 'design' and c.get('verdict') == 'change')
+
+
+# A fix marks where to change, but its causes are still walked: only a cause
+# left alone ends a branch.
+def walks(c):
+    return c.get('reach') == 'changeable' or is_fix(c)
+
+
+def fix_of(a, at, r):
+    fix, change, proportion, hide_reason = one_of(FIXES, r.get('fix')), text(r.get('change')), text(r.get('proportion')), text(r.get('hideReason'))
+    if fix is None:
+        raise refused(a, f'{at} with reach fix or verdict change, give fix: removes, removes-and-guards, or hides.')
+    if fix == 'hides' and hide_reason is None:
+        raise refused(a, f'{at} {HIDES}')
+    if change is None:
+        raise refused(a, f'{at} with reach fix or verdict change, give change: what you would change, so that the report names it.')
+    if proportion is None:
+        raise refused(a, f'{at} with reach fix or verdict change, give proportion: why the change is in proportion to the effects it removes.')
+    return {'fix': fix, 'change': change, 'proportion': proportion, **({} if hide_reason is None else {'hideReason': hide_reason})}
+
+
+def same_of(a, base, at, value):
+    target = parse_path(value)
+    if target is None or len(target) == 1:
+        raise refused(a, f'{at} give same as a step such as 1.2.')
+    c = cause_at(a, target)
+    if c is not None and 'same' in c:
+        target = parse_path(c['same'])
+        c = cause_at(a, target)
+    if c is None:
+        raise refused(a, f'{at} step {label(target)} is not in the analysis.')
+    if c['status'] == 'refuted':
+        raise refused(a, f'{at} step {label(target)} was ruled out.')
+    if target[:len(base)] == base or base[:len(target)] == target:
+        raise refused(a, f'{at} same must name a step outside {owner(a, base)}, and not one of its ancestors.')
+    return {'same': label(target)}
+
+
+def renumbering(before, merged, path):
+    if before is None:
+        return {}
+    news = {c['cause']: j for j, c in enumerate(merged) if 'cause' in c}
+    return {label((*path, i)): None if o.get('cause') not in news else label((*path, news[o['cause']])) for i, o in enumerate(before['causes'])}
+
+
+# A same names its step by number, so a revised level renumbers every same
+# that points into it. It returns the first same whose step is gone.
+def renumber(a, moves):
+    for at, c in nodes(a):
+        if 'same' not in c:
+            continue
+        old = next((step for step in moves if c['same'] == step or c['same'].startswith(f'{step}.')), None)
+        if old is not None and moves[old] is not None:
+            renamed = moves[old] + c['same'][len(old):]
+        else:
+            renamed = None if old is not None else c['same']
+        target = renamed and cause_at(a, parse_path(renamed))
+        if target is None or not is_live(target):
+            return c['same'], label(at)
+        c['same'] = renamed
+    return None
+
+
+def recorded(a, path, combine, entries):
+    def described(c):
+        if 'same' in c:
+            return f"same as {c['same']}"
+        if c['status'] == 'refuted':
+            return 'ruled out'
+        reach = {'changeable': 'changeable', 'fix': f"fix ({c.get('fix')})", 'outside': 'outside your reach', 'decision': 'decision', 'design': f"design ({c.get('verdict')}{', ' + c['fix'] if 'fix' in c else ''})", 'needed': 'needed', 'stop': 'stop'}.get(c.get('reach'), '')
+        return ', '.join(part for part in (c['status'] if c['status'] in ('hypothesis', 'supported') else '', reach) if part != '')
+
+    how = COMBINED[combine] if several(entries) else 'one cause'
+    return f"Recorded for {owner(a, path)}: {how}; {'; '.join(f'{label((*path, i))} {described(c)}' for i, c in enumerate(entries))}."
+
+
+def decisions(path, entries):
+    steps = [label((*path, i)) for i, c in enumerate(entries) if is_live(c) and c['status'] in ('checked', 'supported') and c['reach'] == 'decision']
+    if not steps:
+        return ''
+    return f"{'Step' if len(steps) == 1 else 'Steps'} {', '.join(steps)} {'ends' if len(steps) == 1 else 'end'} at a deliberate decision. {DECISION}"
+
+
+def change_note(a, before, after, path):
+    if before is None:
+        return ''
+    olds = {o['cause'] for o in before['causes'] if 'cause' in o}
+    news = {c['cause'] for c in after if 'cause' in c}
+    added = [label((*path, i)) for i, c in enumerate(after) if 'cause' in c and c['cause'] not in olds]
+    dropped = [f'"{o["cause"]}"' for o in before['causes'] if 'cause' in o and o['cause'] not in news]
+    if not any('reach' in o for o in before['causes'] if 'cause' in o):
+        return ''
+    parts = ([f"added {', '.join(added)}"] if added else []) + ([f"dropped {', '.join(dropped)}"] if dropped else [])
+    return f"The causes of {owner(a, path)} changed after their branches were walked: {'; '.join(parts)}." if parts else ''
+
+
+def resolved(a, c, path):
+    if 'same' not in c:
+        return c, path
+    target = parse_path(c['same'])
+    return cause_at(a, target), target
+
+
+# The visited set ends a cycle of sames, counting it as not covered.
+def covers(a, c, path, seen=frozenset()):
+    c, path = resolved(a, c, path)
+    if path in seen:
+        return False
+    if is_fix(c) or c.get('reach') == 'needed':
+        return True
+    return walks(c) and 'why' in c and is_covered(a, c['why'], path, seen | {path})
+
+
+# A part is settled when a fix covers it, its purpose needs it, or its design is kept.
+def settled(a, c, path):
+    target, _ = resolved(a, c, path)
+    return covers(a, c, path) or target.get('verdict') == 'keep'
+
+
+def is_covered(a, group, base, seen=frozenset()):
+    if group['combine'] == 'parts':
+        return all(settled(a, c, (*base, i)) for i, c in enumerate(group['causes']) if counted(c))
+    each = [covers(a, c, (*base, i), seen) for i, c in enumerate(group['causes']) if counted(c)]
+    return all(each) if group['combine'] == 'any' else any(each)
+
+
+def fixed_under(a, path):
+    return any(is_fix(c) for at, c in nodes(a) if at[:len(path)] == path and len(at) > len(path))
+
+
+# The fixes must cover every symptom.
+def gap_of(a):
+    for k, holder in enumerate(symptoms(a)):
+        gap = gap_in(a, holder['why'], (k,))
+        if gap is not None:
+            return gap
+    return None
+
+
+def gap_in(a, group, base):
+    if is_covered(a, group, base):
+        return None
+    itself = '' if len(base) == 1 else f', or step {label(base)} itself'
+    paths = [(*base, i) for i, c in enumerate(group['causes']) if counted(c)]
+    causes = [cause_at(a, p) for p in paths]
+    if group['combine'] == 'parts':
+        uncovered = next(p for c, p in zip(causes, paths) if not settled(a, c, p))
+        return f'Step {label(uncovered)} makes part of {owner(a, base)}, and nothing settles it: fix it or a step below it, show its purpose needs it (reach needed), or keep it as a design.'
+    if group['combine'] == 'any':
+        uncovered = next(p for c, p in zip(causes, paths) if not covers(a, c, p))
+        return f'Step {label(uncovered)} is enough alone to cause {owner(a, base)}, and no fix covers it: fix it, or a step below it{itself}.'
+    partly = next(((c, p) for c, p in zip(causes, paths) if is_live(c) and 'why' in c and fixed_under(a, p)), None)
+    if partly is not None:
+        return gap_in(a, partly[0]['why'], partly[1])
+    choices = f'step {label(paths[0])}' if len(paths) == 1 else f"one of steps {', '.join(map(label, paths))}"
+    return f'No fix covers {owner(a, base)}: fix {choices}, or a step below{itself}.'
+
+
+# Every branch ends at a cause left alone, so each end needs a reason.
+def branch_ends(a):
+    return [at for at, c in nodes(a) if is_live(c) and 'reach' in c and not walks(c)]
+
+
+def unfixed_of(a, value):
+    items = records(value)
+    if items is None:
+        raise refused(a, 'Give leftAlone: a leftAlone line with the step and a reason line for each branch end.')
+    unfixed = []
+    for r in items:
+        path = parse_path(r.get('step'))
+        if path is None or len(path) == 1 or cause_at(a, path) is None:
+            raise refused(a, f"Step {step_text(r.get('step'))} in leftAlone is not in the analysis.")
+        reason = text(r.get('reason'))
+        if reason is None:
+            raise refused(a, f'Give the reason you leave step {label(path)} alone.')
+        unfixed.append({'step': label(path), 'reason': reason})
+    return unfixed
+
+
+def avoidable_of(a, value):
+    items = records(value)
+    if items is None:
+        raise refused(a, AVOIDABLE)
+    found = []
+    for r in items:
+        what, avoid, worth, why = text(r.get('avoidable')), text(r.get('avoid')), one_of(('yes', 'no'), r.get('worth')), text(r.get('why'))
+        if None in (what, avoid, worth, why):
+            raise refused(a, f"Avoidable {what or '(none given)'}: give avoid, worth: yes or no, and why. {AVOIDABLE}")
+        found.append({'avoidable': what, 'avoid': avoid, 'worth': worth, 'why': why})
+    return found
+
+
+def step_text(value):
+    return '(none given)' if value is None else value if isinstance(value, str) else json.dumps(value)
+
+
+def missing_of(a, unfixed):
+    named = {u['step'] for u in unfixed}
+    return [label(end) for end in branch_ends(a) if label(end) not in named]
+
+
+def check(a):
+    if open_of(a)[0] != 'conclude':
+        return False, f"{a['id']} is not ready to conclude: not every branch has ended. {prompt(a)}"
+    gap = gap_of(a)
+    if gap is not None:
+        return False, f"{a['id']} is not ready to conclude. These fixes do not settle {every(a)}. {gap}"
+    ends = ', '.join(label(end) for end in branch_ends(a))
+    return True, f"{a['id']} is ready to conclude with {f'leftAlone for {ends}' if ends else 'leftAlone: none'}, and avoidable. {weak_note(a)}".rstrip()
+
+
+def conclude(a, input, record):
+    a = copy.deepcopy(a)
+    if open_of(a)[0] != 'conclude':
+        raise refused(a, 'Not every branch has ended yet.')
+    if gap_of(a) is not None:
+        raise Refusal(conclusion_prompt(a))
+    unfixed = unfixed_of(a, input.get('leftAlone'))
+    missing = missing_of(a, unfixed)
+    if missing:
+        raise refused(a, f"Give leftAlone: each branch end, and why you leave it alone. Missing: {', '.join(missing)}.")
+    avoidable = avoidable_of(a, input.get('avoidable'))
+    report = report_of(a, unfixed, avoidable, record)
+    a.update(status='concluded', leftAlone=unfixed, avoidable=avoidable, report=report)
+    return a, f'Put this report in your reply:\n\n{report}'
+
+
+def verdict(c):
+    head = f"Fixed here: {sentence(c['change'])} The change"
+    if c['fix'] == 'removes':
+        return f'{head} removes the cause.'
+    if c['fix'] == 'removes-and-guards':
+        return f'{head} removes the cause and adds a guard.'
+    return f"{head} only hides the cause. Why: {sentence(c['hideReason'])}"
+
+
+def lines_of(a, group, base, reasons):
+    lines = []
+    for i, c in enumerate(group['causes']):
+        path = (*base, i)
+        head = f"{'  ' * (len(base) - 1)}{label(path)}"
+        if 'same' in c:
+            lines.append(f"{head} Same as {c['same']}.")
+            continue
+        standing, ending = c['status'] != 'refuted', ENDINGS.get(c.get('reach'))
+        parts = [
+            f"{head} {sentence(c['cause'])}",
+            *([f"Weight: {sentence(c['weight'])}"] if 'weight' in c else []),
+            *([f"Share: {sentence(c['share'])} Needs: {sentence(c['need'])}"] if 'share' in c and 'need' in c else []),
+            *([] if standing else ['Ruled out.']),
+            *([f"Supported, not proven{' by ' + ', '.join(c['cites']) if c.get('cites') else ''}. Proof: {sentence(c['proof'])} Cannot be run: {sentence(c['unprovable'])}"] if c['status'] == 'supported' else []),
+            *([ending] if ending is not None and standing else []),
+            *([f"Its causes: {COMBINED[c['why']['combine']]}."] if 'why' in c and several(c['why']['causes']) and c['why']['combine'] != 'parts' else []),
+            *([f"Its parts: {sentence(c['why']['coverage'])}"] if 'why' in c and c['why']['combine'] == 'parts' else []),
+            *([f"Designed so. Purpose: {sentence(c['purpose'])}"] if c.get('reach') == 'design' and standing else []),
+            *([verdict(c)] if is_fix(c) and standing else []),
+            *([rests_on(unproven(a, path))] if is_fix(c) and standing and unproven(a, path) else []),
+            *([f"Kept: {sentence(c['keepReason'])}"] if c.get('verdict') == 'keep' and standing else []),
+            *([f'Left alone: {sentence(reasons[label(path)])}'] if label(path) in reasons else []),
+        ]
+        lines += [' '.join(parts), *(lines_of(a, c['why'], path, reasons) if 'why' in c else [])]
+    return lines
+
+
+# The causes a symptom's walk reaches, following each same to its step.
+def reached_from(a, k):
+    found = set()
+
+    def go(group, base):
+        for i, c in enumerate(group['causes']):
+            c, path = resolved(a, c, (*base, i))
+            if c is None or path in found or not is_live(c):
+                continue
+            found.add(path)
+            if 'why' in c:
+                go(c['why'], path)
+
+    go(root_of(a, k)['why'], (k,))
+    return found
+
+
+# For several symptoms: the fixes that each one's walk reaches, and the causes
+# that a same shares across symptoms.
+def shared_lines(a):
+    count = len(symptoms(a))
+    reached = [reached_from(a, k) for k in range(count)]
+    fixes = [(at, c) for at, c in nodes(a) if is_live(c) and is_fix(c)]
+    lines = ['Fixes by symptom:']
+    for k in range(count):
+        mine = [label(at) for at, _ in fixes if at in reached[k]]
+        others = [label((j,)) for j in range(count) if j != k and reached[j] & reached[k]]
+        lines.append(f"- {label((k,))}: {'fixed at ' + ', '.join(mine) if mine else 'no fix'}. " + (f"Shares causes with {', '.join(others)}." if others else 'Shares no cause with the other symptoms.'))
+    shared = []
+    for at, c in nodes(a):
+        target = parse_path(c['same']) if 'same' in c else None
+        if target is not None and target[0] != at[0] and target not in shared:
+            shared.append(target)
+    named = [f"{label(t)} ({', '.join(label((k,)) for k in range(count) if t in reached[k])})" for t in shared]
+    return [*lines, f"Shared causes: {'; '.join(named)}." if named else 'Shared causes: none.']
+
+
+# Each evidence item and the causes that cite it, so that a fact backing
+# several unproven causes shows once.
+def citers(a):
+    found = {}
+    for at, c in nodes(a):
+        if is_live(c):
+            for i in c.get('cites', []):
+                found.setdefault(i, []).append(label(at))
+    return found
+
+
+def evidence_lines(a):
+    items, cited = a.get('evidenceItems', []), citers(a)
+    return ['Evidence:', *(f"- {e['id']}: {sentence(e['text'])} Cited by {', '.join(cited[e['id']]) if e['id'] in cited else 'no cause'}." for e in items)] if items else []
+
+
+def report_of(a, unfixed, avoidable, record):
+    reasons = {u['step']: u['reason'] for u in unfixed}
+    body = []
+    for k, holder in enumerate(symptoms(a)):
+        why = holder['why']
+        heading = f"Why (each makes part of it; {why['coverage']}):" if why['combine'] == 'parts' else f"Why ({COMBINED[why['combine']]}):" if several(why['causes']) else 'Why:'
+        name = f'Symptom {label((k,))}' if is_multi(a) else 'Symptom'
+        body += [f"{name}: {sentence(holder['symptom'])}", heading, *lines_of(a, why, (k,), reasons)]
+    evidence = evidence_lines(a)
+    avoid = [f"- {sentence(v['avoidable'])} Change: {sentence(v['avoid'])} Worth it: {v['worth']}. {sentence(v['why'])}" for v in avoidable]
+    return '\n'.join([*body, *evidence, *(shared_lines(a) if is_multi(a) else []), *(['How it could have been avoided:', *avoid] if avoid else ['How it could have been avoided: nothing found.']), f'Evidence and reasons: {record}'])
+
+
+def symptoms_line(a):
+    if not is_multi(a):
+        return f"Symptom: {sentence(a['symptom'])}"
+    return 'Symptoms: ' + ' '.join(f"{label((k,))} {sentence(h['symptom'])}" for k, h in enumerate(symptoms(a)))
+
+
+# The first symptom, and how many more, for a listing.
+def title_of(a):
+    more = len(a.get('moreSymptoms', []))
+    return f"{a['symptom']}{f' (and {more} more)' if more else ''}"
+
+
+def abandon(a, input):
+    a = copy.deepcopy(a)
+    reason = text(input.get('reason'))
+    if reason is None:
+        raise refused(a, 'Give reason: why you close the analysis without a conclusion.')
+    a.update(status='abandoned', reason=reason)
+    return a, f"Closed {a['id']} without a conclusion. {symptoms_line(a)} Reason: {sentence(reason)} Say in your reply that you dropped the analysis and why."
+
+
+class Store:
+    def __init__(self, root):
+        self.dir = root / 'analyses'
+
+    def path_of(self, id):
+        return self.dir / f'{id}.json'
+
+    def analyses(self):
+        found = [a for a in map(read_json, self.dir.glob('*.json')) if isinstance(a, dict)]
+        return sorted(found, key=lambda a: (a.get('started', ''), a.get('id', '')))
+
+    def open(self):
+        return [a for a in self.analyses() if a.get('status') == 'open']
+
+    def new_id(self):
+        while True:
+            id = f'rc-{datetime.date.today():%Y%m%d}-{secrets.token_hex(3)}'
+            if not self.path_of(id).exists():
+                return id
+
+    def log_of(self, id):
+        return self.dir / f'{id}.log'
+
+    def log(self, id, command, body, reply):
+        """Append each call and its reply, so the user can follow the walk live with tail -f."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with open(self.log_of(id), 'a', encoding='utf-8') as f:
+            f.write(f"=== {now()} {command}\n{body.strip()}\n--- reply\n{reply.strip()}\n\n")
+
+    def load(self, id):
+        return read_json(self.path_of(id))
+
+    def save(self, a):
+        write_json(self.dir, self.path_of(a['id']), a)
+
+
+def read_json(path):
+    """The JSON value in a file, or None if the file cannot be read or holds no JSON."""
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(dir, path, value):
+    dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir, prefix='.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='microseconds')
+
+
+# The text form has no brace next to a quote, which Claude Code's Bash check
+# asks approval for even under an allow rule; a heredoc of JSON always has one.
+CAUSE_KEYS = ('evidence', 'cites', 'proof', 'unprovable', 'status', 'effects', 'reach', 'fix', 'change', 'proportion', 'hideReason', 'purpose', 'verdict', 'keepReason', 'share', 'need', 'weight')
+
+TOP_KEYS = ('symptom', 'reason', 'step', 'combine', 'coverage')
+
+LINE = re.compile(r'^([A-Za-z]+):(?:[ \t]+(.*))?$')
+
+EVIDENCE_LINE = re.compile(r'^evidence[ \t]+([A-Za-z0-9]+):(?:[ \t]+(.*))?$')
+
+
+def text_input_of(body):
+    value, entry, kind, last = {}, None, None, None
+
+    def put(target, key, v, n):
+        nonlocal last
+        if key == 'symptom' and key in target:
+            if not isinstance(target[key], list):
+                target[key] = [target[key]]
+            target[key].append(v)
+            last = (target[key], -1)
+            return
+        if key == 'effects':
+            effects = target.setdefault('effects', [])
+            if v != 'none':
+                effects.append(v)
+            last = (effects, -1) if v != 'none' else None
+            return
+        if key in target:
+            raise Refusal(f'Line {n}: {key} is given twice.')
+        target[key] = v
+        last = (target, key)
+
+    for n, line in enumerate(body.splitlines(), 1):
+        if line.strip() == '':
+            continue
+        if line[0] in ' \t':
+            if last is None:
+                raise Refusal(f'Line {n} is indented, but no value comes before it to continue.')
+            last[0][last[1]] += '\n' + line.strip()
+            continue
+        m = EVIDENCE_LINE.match(line)
+        if m is not None:
+            # An evidence item belongs to the analysis, wherever it stands.
+            item = {'id': m.group(1), 'text': (m.group(2) or '').strip()}
+            value.setdefault('evidenceItems', []).append(item)
+            last = (item, 'text')
+            continue
+        m = LINE.match(line)
+        if m is None:
+            raise Refusal(f'Line {n} is not "key: value": {line.strip()}')
+        key, v = m.group(1), (m.group(2) or '').strip()
+        if key in ('cause', 'same'):
+            entry, kind = {}, 'cause'
+            value.setdefault('causes', []).append(entry)
+            put(entry, key, v, n)
+        elif key == 'leftAlone':
+            items = value.setdefault('leftAlone', [])
+            entry, kind, last = (None, None, None) if v == 'none' else ({'step': v}, 'leftAlone', None)
+            if entry is not None:
+                items.append(entry)
+        elif key == 'reason' and kind == 'leftAlone':
+            put(entry, key, v, n)
+        elif key == 'avoidable':
+            items = value.setdefault('avoidable', [])
+            entry, kind, last = (None, None, None) if v == 'none' else ({}, 'avoidable', None)
+            if entry is not None:
+                items.append(entry)
+                put(entry, key, v, n)
+        elif key in ('avoid', 'worth', 'why') and kind == 'avoidable':
+            put(entry, key, v, n)
+        elif key in CAUSE_KEYS:
+            if kind != 'cause':
+                raise Refusal(f'Line {n}: {key} belongs to a cause. Start the cause with a cause line.')
+            put(entry, key, v, n)
+        elif key in TOP_KEYS:
+            entry, kind = None, None
+            put(value, key, v, n)
+        else:
+            raise Refusal(f'Line {n}: unknown key {key}.')
+    return value
+
+
+def input_of(body):
+    if body.strip() == '':
+        raise Refusal('Give the input on stdin, as "key: value" lines.')
+    if not body.lstrip().startswith(('{', '[')):
+        return text_input_of(body)
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise Refusal(f'The input on stdin is not JSON ({e}). Give one JSON object.') from None
+    if not isinstance(value, dict):
+        raise Refusal('Give the input on stdin as one JSON object.')
+    return value
+
+
+def open_analysis(store, id):
+    opens = store.open()
+    found = next((a for a in opens if a['id'] == id), None)
+    if found is not None:
+        return found
+    listing = ', '.join(f"{a['id']} ({title_of(a)})" for a in opens)
+    raise Refusal(f"No open analysis has id {id or '(none given)'}. {'None is open; run rootcause start.' if listing == '' else f'Open: {listing}.'}")
+
+
+STALE_AFTER = datetime.timedelta(days=1)
+
+
+def project_of(a, names):
+    """The real path of the project an analysis belongs to: the directory its session runs in, as the session's
+    transcript records it, or, without a transcript, the directory the start command ran in. The command may run in
+    a directory the agent changed to, such as a subdirectory or another worktree, while the session's stays."""
+    cwd = names.info(a['session'])['cwd'] if isinstance(a.get('session'), str) else None
+    cwd = cwd if isinstance(cwd, str) and cwd != '' else a.get('cwd')
+    return os.path.realpath(cwd) if isinstance(cwd, str) and cwd != '' else None
+
+
+def stale(store, cwd):
+    """The open analyses of the project at cwd that were started more than a day ago: an analysis left open is a
+    finding nobody acts on. An analysis is the project's when its project is cwd or a directory inside it, compared
+    as real paths."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - STALE_AFTER
+    here, names = pathlib.Path(os.path.realpath(cwd)), Names(claude_dir())
+    found = []
+    for a in store.open():
+        try:
+            started = datetime.datetime.fromisoformat(a.get('started', ''))
+        except ValueError:
+            continue
+        project = project_of(a, names) if started < cutoff else None
+        if project is not None and pathlib.Path(project).is_relative_to(here):
+            found.append((started, a))
+    return [a for _, a in sorted(found, key=lambda x: x[0])]
+
+
+def run(store, command, id, body, only_stale=False):
+    if command == 'list':
+        if only_stale:
+            # Nothing when none is stale, so that the hooks module needs no text to tell it.
+            return '\n'.join(f"{a['id']} (open since {a['started'][:10]}: {title_of(a)})" for a in stale(store, os.getcwd()))
+        opens = store.open()
+        return '\n'.join(f"{a['id']} ({title_of(a)})" for a in opens) if opens else 'None is open.'
+    if command == 'start':
+        a, reply = new_analysis(store.new_id(), input_of(body))
+        session = os.environ.get('CLAUDE_CODE_SESSION_ID', '')
+        store.save({**a, 'status': 'open', 'started': now(), 'cwd': os.getcwd(),
+                    **({'session': session} if SESSION.fullmatch(session) else {})})
+        store.log(a['id'], command, body, reply)
+        return reply
+    a = open_analysis(store, id)
+    try:
+        reply = step(store, a, command, body)
+    except Refusal as e:
+        store.log(a['id'], command, body, f'Refused: {e}')
+        raise
+    store.log(a['id'], command, body, reply)
+    return reply
+
+
+def step(store, a, command, body):
+    try:
+        input = {} if command == 'check' else input_of(body)
+    except Refusal as e:
+        raise refused(a, str(e)) from None
+    if command == 'check':
+        ready, reply = check(a)
+        if not ready:
+            raise Refusal(reply)
+        return reply
+    if command == 'conclude':
+        a, reply = conclude(a, input, store.path_of(a['id']))
+    else:
+        a, reply = {'answer': answer, 'abandon': abandon, 'add-symptom': add_symptom}[command](a, input)
+    store.save({**a, 'closed': now()} if a['status'] != 'open' else a)
+    return reply
+
+
+# The web UI. One server on 127.0.0.1 serves every Claude Code session's
+# analyses. It stays up while a Claude Code session that started an analysis
+# still runs, or a browser has a page open, and exits GRACE_SECONDS after both
+# stop.
+PORT = 7391
+
+CHECK_SECONDS = 30
+
+GRACE_SECONDS = 300
+
+SESSION = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+
+ANALYSIS = re.compile(r'rc-\d{8}-[0-9a-f]{6}')
+
+PAGE = pathlib.Path(__file__).resolve().parent.parent / 'web' / 'index.html'
+
+
+def claude_dir():
+    return pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or pathlib.Path.home() / '.claude')
+
+
+def transcript_of(session, claude):
+    """The transcript of a Claude Code session, <claude>/projects/<project>/<session>.jsonl, or None. The folder's
+    name is derived from the project's path, but lossily and, for a long path, shortened with a hash, so only the
+    transcript's own cwd tells the project."""
+    if not isinstance(session, str) or not SESSION.fullmatch(session):
+        return None
+    return next((claude / 'projects').glob(f'*/{session}.jsonl'), None)
+
+
+def process_of(pid):
+    """The command name, parent pid and start time of a running process, or None."""
+    try:
+        stat = pathlib.Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None if pathlib.Path('/proc/self/stat').exists() else ps_of(pid)
+    head, _, rest = stat.rpartition(')')
+    fields = rest.split()
+    return None if fields[0] in ('Z', 'X') else (head.partition('(')[2], int(fields[1]), fields[19])
+
+
+def ps_of(pid):
+    try:
+        out = subprocess.run(['ps', '-o', 'ppid=', '-o', 'lstart=', '-o', 'comm=', '-p', str(pid)], capture_output=True, text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (os.path.basename(' '.join(out[6:])), int(out[0]), ' '.join(out[1:6])) if len(out) >= 7 else None
+
+
+# The start time tells a live process from a later one that reuses its pid.
+def is_alive(pid, start):
+    found = process_of(pid)
+    return found is not None and found[2] == start
+
+
+def claude_process():
+    """The pid and start time of the Claude Code process this command runs under."""
+    pid = os.getppid()
+    for _ in range(32):
+        found = process_of(pid)
+        if found is None:
+            break
+        # A release of Claude Code runs as .../claude/versions/<version>, so
+        # its command name is the version: the executable's path tells it.
+        try:
+            name = os.readlink(f'/proc/{pid}/exe')
+        except OSError:
+            name = found[0]
+        if 'claude' in name.lower():
+            return pid, found[2]
+        if found[1] <= 1:
+            break
+        pid = found[1]
+    env = os.environ.get('CLAUDE_PID', '')
+    found = process_of(int(env)) if env.isdigit() else None
+    return (int(env), found[2]) if found else None
+
+
+class Sessions:
+    """The Claude Code sessions that started analyses: ROOTCAUSE_DIR/sessions/<session id>.json.
+
+    Each names the analyses its hooks claimed, the Claude Code processes that ran
+    it (pid and start time), and the sessions it continued as. A session goes on
+    under a new id when the user backgrounds it, and Claude Code's own registry,
+    ~/.claude/sessions/<pid>.json, is the only place that says so: the old
+    process's entry gets parkedJobId, the new one's jobId. That registry is not
+    a documented interface, so follow() reads it defensively and keeps each link
+    it finds here, since the old entry goes when its process exits.
+    """
+
+    def __init__(self, root, claude=None):
+        self.dir = root / 'sessions'
+        self.claude = claude if claude is not None else claude_dir() / 'sessions'
+
+    def path_of(self, session):
+        return self.dir / f'{session}.json'
+
+    @contextlib.contextmanager
+    def locked(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with open(self.dir / '.lock', 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    def load(self, session):
+        found = read_json(self.path_of(session))
+        return {'analyses': [], 'pids': [], 'continuedAs': [], **found} if isinstance(found, dict) else None
+
+    def all(self):
+        found = {}
+        for path in self.dir.glob('*.json'):
+            r = self.load(path.stem)
+            if r is not None:
+                found[path.stem] = r
+        return found
+
+    def save(self, r):
+        write_json(self.dir, self.path_of(r['session']), r)
+
+    def new(self, session):
+        return {'session': session, 'registered': now(), 'analyses': [], 'pids': [], 'continuedAs': []}
+
+    def register(self, session, process=None, claim=None):
+        with self.locked():
+            r = self.load(session) or self.new(session)
+            if claim is not None and claim not in r['analyses']:
+                r['analyses'].append(claim)
+            if process is not None and {'pid': process[0], 'start': process[1]} not in r['pids']:
+                r['pids'].append({'pid': process[0], 'start': process[1]})
+            self.save(r)
+
+    def claude_entries(self):
+        found = []
+        for path in self.claude.glob('*.json') if self.claude.is_dir() else ():
+            e = read_json(path)
+            if isinstance(e, dict) and isinstance(e.get('sessionId'), str) and isinstance(e.get('pid'), int):
+                found.append(e)
+        return found
+
+    def follow(self):
+        """Records each backgrounded session's continuation, for the sessions here."""
+        entries = self.claude_entries()
+        jobs = {e['jobId']: e['sessionId'] for e in entries if isinstance(e.get('jobId'), str)}
+        links = [(e['sessionId'], jobs[e['parkedJobId']]) for e in entries if e.get('parkedJobId') in jobs]
+        with self.locked():
+            for old, new in links:
+                r = self.load(old)
+                if r is None or new == old or new in r['continuedAs']:
+                    continue
+                r['continuedAs'].append(new)
+                self.save(r)
+                if self.load(new) is None:
+                    self.save(self.new(new))
+
+    def family(self, session, regs=None):
+        """The session, the sessions it continued as, and those it continues, transitively."""
+        regs = self.all() if regs is None else regs
+        found, todo = set(), [session]
+        while todo:
+            s = todo.pop()
+            if s in found:
+                continue
+            found.add(s)
+            todo += regs.get(s, {}).get('continuedAs', [])
+            todo += [o for o, r in regs.items() if s in r['continuedAs']]
+        return found
+
+    def is_alive(self):
+        """Whether a Claude Code process of any session here runs. Drops the pids that died."""
+        alive = False
+        with self.locked():
+            regs = self.all()
+            for r in regs.values():
+                pids = [p for p in r['pids'] if is_alive(p['pid'], p['start'])]
+                if pids != r['pids']:
+                    self.save({**r, 'pids': pids})
+                alive = alive or pids != []
+        return alive or any(e['sessionId'] in regs and is_alive(e['pid'], str(e.get('procStart'))) for e in self.claude_entries())
+
+
+def stamps_of_log(path):
+    """When each cause first and last appeared in an answer, from the log, for records without times."""
+    try:
+        log = path.read_text(encoding='utf-8')
+    except OSError:
+        return {}
+    found = {}
+    for m in re.finditer(r'^=== (\S+) answer\n(.*?)\n--- reply\n(.*?)(?=\n\n=== |\Z)', log, re.M | re.S):
+        if m.group(3).startswith('Refused:'):
+            continue
+        try:
+            causes = [c.get('cause') for c in input_of(m.group(2)).get('causes', []) if isinstance(c, dict)]
+        except (Refusal, AttributeError):
+            continue
+        for cause in causes:
+            if isinstance(cause, str):
+                found[cause.strip()] = (found.get(cause.strip(), (m.group(1),))[0], m.group(1))
+    return found
+
+
+def with_stamps(a, log):
+    """The analysis with added and revised on every cause, estimated where the record has none."""
+    a = copy.deepcopy(a)
+    stamps = None
+    for _, c in nodes(a):
+        if 'added' in c:
+            continue
+        stamps = stamps_of_log(log) if stamps is None else stamps
+        first, last = stamps.get(c.get('cause'), (a.get('started'), a.get('started')))
+        c.update(added=first, revised=c.get('revised', last), estimated=True)
+    return a
+
+
+def summary_of(a):
+    return {k: a.get(k) for k in ('id', 'symptom', 'status', 'started', 'closed', 'session')} | {'more': len(a.get('moreSymptoms', [])), 'steps': sum(1 for _ in nodes(a))}
+
+
+# A session's name and working directory, for the pages to show beside its id.
+# Claude Code keeps both only in undocumented files: its transcript,
+# <claude>/projects/<project>/<session>.jsonl, appends agent-name (a name the
+# user or Claude Code gave) and ai-title rows, and its entries carry cwd; the
+# live registry entry has name and cwd too. Read the transcript's head and tail
+# only, and once per change of the file.
+class Names:
+    TAIL = 1 << 20
+
+    def __init__(self, claude):
+        self.claude, self.cache = claude, {}
+
+    def info(self, session, live=()):
+        name, cwd = None, None
+        path = transcript_of(session, self.claude)
+        if path is not None:
+            try:
+                key = (path, path.stat().st_mtime_ns)
+                if self.cache.get(session, (None,))[0] != key:
+                    self.cache[session] = (key, self.read(path))
+                name, cwd = self.cache[session][1]
+            except OSError:
+                pass
+        for entry in live:
+            if entry['sessionId'] == session:
+                if entry.get('nameSource') in ('user', 'auto') and entry.get('name'):
+                    name = entry['name']
+                cwd = cwd or entry.get('cwd')
+        return {'name': name, 'cwd': cwd}
+
+    def read(self, path):
+        with open(path, 'rb') as f:
+            head = f.read(self.TAIL)
+            f.seek(max(0, path.stat().st_size - self.TAIL))
+            tail = f.read()
+        named, titled, cwd = None, None, None
+        for text in (head, tail):
+            for line in text.decode('utf-8', 'replace').splitlines():
+                if '"cwd"' not in line and 'agent-name' not in line and 'ai-title' not in line and 'custom-title' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                cwd = cwd or row.get('cwd')
+                if row.get('type') in ('agent-name', 'custom-title'):
+                    named = row.get('agentName') or row.get('customTitle') or named
+                elif row.get('type') == 'ai-title':
+                    titled = row.get('aiTitle') or titled
+        return named or titled, cwd
+
+
+def unclaimed(analyses, regs):
+    """The analyses that name no session and that no registered session claimed."""
+    claimed = {id for r in regs.values() for id in r['analyses']}
+    return [a for a in analyses if 'session' not in a and a['id'] not in claimed]
+
+
+class Web(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, root, port, claude=None):
+        super().__init__(('127.0.0.1', port), Page)
+        self.store, self.sessions = Store(root), Sessions(root, claude)
+        self.names = Names(self.sessions.claude.parent)
+        self.clients, self.lock = 0, threading.Lock()
+        self.check_seconds, self.grace_seconds = CHECK_SECONDS, GRACE_SECONDS
+
+    def is_wanted(self):
+        self.sessions.follow()
+        with self.lock:
+            clients = self.clients
+        return clients > 0 or self.sessions.is_alive()
+
+    def watch(self):
+        idle = None
+        while True:
+            time.sleep(self.check_seconds)
+            if self.is_wanted():
+                idle = None
+                continue
+            idle = idle if idle is not None else time.monotonic()
+            if time.monotonic() - idle >= self.grace_seconds:
+                self.shutdown()
+                return
+
+    def run(self):
+        threading.Thread(target=self.watch, daemon=True).start()
+        try:
+            self.serve_forever(poll_interval=0.5)
+        finally:
+            self.server_close()
+
+    def signature(self):
+        """Each analysis and session file with its change time, to tell a page what changed."""
+        found = {}
+        for dir in (self.store.dir, self.sessions.dir):
+            for path in dir.glob('*.json') if dir.is_dir() else ():
+                try:
+                    found[path.name] = path.stat().st_mtime_ns
+                except OSError:
+                    continue
+        return found
+
+    def listing(self):
+        """Every session with analyses, one row per family of continued sessions, newest first."""
+        regs, analyses = self.sessions.all(), self.store.analyses()
+        ids = set(regs) | {a['session'] for a in analyses if 'session' in a}
+        rows, seen = [], set()
+        for session in sorted(ids):
+            if session in seen:
+                continue
+            family = self.sessions.family(session, regs)
+            seen |= family
+            found = self.of_family(family, regs, analyses)
+            if found:
+                first = min(family, key=lambda s: regs.get(s, {}).get('registered', '~'))
+                rows.append({'session': first, 'sessions': sorted(family), 'analyses': [summary_of(a) for a in found]})
+        loose = [summary_of(a) for a in unclaimed(analyses, regs)]
+        rows.sort(key=lambda r: max(a['started'] or '' for a in r['analyses']), reverse=True)
+        live = self.sessions.claude_entries()
+        for r in rows:
+            r['info'] = {s: self.names.info(s, live) for s in r['sessions']}
+        return rows + ([{'session': 'none', 'sessions': [], 'analyses': loose[::-1], 'info': {}}] if loose else [])
+
+    def of_family(self, family, regs, analyses):
+        claimed = {id for s in family for id in regs.get(s, {}).get('analyses', [])}
+        return sorted((a for a in analyses if a.get('session') in family or a['id'] in claimed), key=lambda a: a.get('started') or '', reverse=True)
+
+    def session(self, session):
+        regs, analyses = self.sessions.all(), self.store.analyses()
+        if session == 'none':
+            return {'session': 'none', 'sessions': [], 'analyses': [summary_of(a) for a in unclaimed(analyses, regs)[::-1]]}
+        family = self.sessions.family(session, regs)
+        live = self.sessions.claude_entries()
+        return {'session': session, 'sessions': sorted(family), 'info': {s: self.names.info(s, live) for s in family},
+                'analyses': [summary_of(a) for a in self.of_family(family, regs, analyses)]}
+
+    def analysis(self, id):
+        a = self.store.load(id)
+        if a is None:
+            return None
+        return {**with_stamps(a, self.store.log_of(id)), **({'sessionInfo': self.names.info(a['session'], self.sessions.claude_entries())} if 'session' in a else {})}
+
+
+class Page(http.server.BaseHTTPRequestHandler):
+    server_version = 'rootcause'
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        # Only a page from this server may read it: a name that resolves to
+        # 127.0.0.1 from another site does not pass the Host check.
+        host = (self.headers.get('Host') or '').rsplit(':', 1)[0]
+        if host not in ('127.0.0.1', 'localhost'):
+            return self.send(403, 'text/plain', b'Forbidden')
+        path = urllib.parse.urlsplit(self.path).path
+        parts = path.strip('/').split('/')
+        if path == '/' or (len(parts) == 2 and parts[0] in ('s', 'a')):
+            return self.send(200, 'text/html; charset=utf-8', PAGE.read_bytes())
+        if path == '/api/sessions':
+            return self.json(self.server.listing())
+        if len(parts) == 3 and parts[:2] == ['api', 's'] and SESSION.fullmatch(parts[2]):
+            return self.json(self.server.session(parts[2]))
+        if len(parts) == 3 and parts[:2] == ['api', 'a'] and ANALYSIS.fullmatch(parts[2]):
+            found = self.server.analysis(parts[2])
+            return self.json(found) if found is not None else self.send(404, 'application/json', b'null')
+        if path == '/events':
+            return self.events()
+        self.send(404, 'text/plain', b'Not found')
+
+    def send(self, code, kind, body):
+        self.send_response(code)
+        self.send_header('Content-Type', kind)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def json(self, value):
+        self.send(200, 'application/json', json.dumps(value, ensure_ascii=False).encode('utf-8'))
+
+    # Server-sent events: the names of the files that changed, polled twice a
+    # second, and a comment every 15 seconds, whose failed write ends a client
+    # that left.
+    def events(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        web = self.server
+        with web.lock:
+            web.clients += 1
+        try:
+            last, beat = web.signature(), time.monotonic()
+            self.wfile.write(b': hello\n\n')
+            self.wfile.flush()
+            while True:
+                time.sleep(0.5)
+                seen = web.signature()
+                changed = sorted(k for k in seen.keys() | last.keys() if seen.get(k) != last.get(k))
+                last = seen
+                if changed:
+                    self.wfile.write(f'data: {json.dumps(changed)}\n\n'.encode('utf-8'))
+                elif time.monotonic() - beat < 15:
+                    continue
+                else:
+                    self.wfile.write(b': beat\n\n')
+                self.wfile.flush()
+                beat = time.monotonic()
+        except OSError:
+            pass
+        finally:
+            with web.lock:
+                web.clients -= 1
+
+
+def serve(args, stdout, claude=None):
+    """Registers a session if one is given, and makes sure the server runs; prints its URL."""
+    r = root()
+    port = int(args.port or os.environ.get('ROOTCAUSE_PORT') or PORT)
+    session = args.session
+    if session is not None:
+        if not SESSION.fullmatch(session) or (args.claim is not None and not ANALYSIS.fullmatch(args.claim)):
+            raise Refusal('Give --session as a Claude Code session id, and --claim as an analysis id.')
+        sessions = Sessions(r, claude)
+        sessions.follow()
+        if args.if_known and not ({session} & (set(sessions.all()) | {a.get('session') for a in Store(r).analyses()})):
+            return 0
+        sessions.register(session, claude_process(), args.claim)
+    url = f"http://127.0.0.1:{port}{f'/s/{session}' if session else '/'}"
+    try:
+        web = Web(r, port, claude)
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        print(url, file=stdout)
+        return 0
+    if not args.detach:
+        print(url, file=stdout, flush=True)
+        web.run()
+        return 0
+    # Bound before the fork, so a second start finds the port taken. The
+    # grandchild leaves the caller's session and pipes, so it outlives the call.
+    child = os.fork()
+    if child:
+        web.socket.close()
+        os.waitpid(child, 0)
+        print(url, file=stdout)
+        return 0
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    null = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null, fd)
+    try:
+        web.run()
+    finally:
+        os._exit(0)
+
+
+def parser():
+    p = argparse.ArgumentParser(prog='rootcause', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = p.add_subparsers(dest='command', required=True)
+    commands.add_parser('start', help='start an analysis')
+    commands.add_parser('answer', help='give the causes the open question asks for').add_argument('id', nargs='?')
+    commands.add_parser('add-symptom', help='add a symptom, which may share causes, to an open analysis').add_argument('id', nargs='?')
+    commands.add_parser('check', help='report what conclude would refuse, without closing').add_argument('id', nargs='?')
+    commands.add_parser('conclude', help='close an analysis whose branches have all ended').add_argument('id', nargs='?')
+    commands.add_parser('abandon', help='close an analysis without a conclusion').add_argument('id', nargs='?')
+    commands.add_parser('list', help='list the open analyses').add_argument(
+        '--stale', action='store_true', help="only this project's, open for more than a day; nothing if none is")
+    web = commands.add_parser('serve', help='run the web UI, or with --detach make sure it runs')
+    web.add_argument('--port', type=int, help=f'the port on 127.0.0.1 (default ROOTCAUSE_PORT or {PORT})')
+    web.add_argument('--detach', action='store_true', help='run in the background; do nothing if the server already runs')
+    web.add_argument('--session', help='register this Claude Code session and the process it runs in')
+    web.add_argument('--claim', help='with --session, an analysis this session started')
+    web.add_argument('--if-known', action='store_true', help='with --session, only if the session already has analyses')
+    return p
+
+
+def root():
+    return pathlib.Path(os.environ.get('ROOTCAUSE_DIR') or pathlib.Path.home() / '.claude' / 'rootcause')
+
+
+def main(argv, stdin, stdout, stderr, store=None):
+    args = parser().parse_args(argv)
+    body = '' if args.command in ('list', 'check', 'serve') or stdin.isatty() else stdin.read()
+    try:
+        if args.command == 'serve':
+            return serve(args, stdout)
+        reply = run(store or Store(root()), args.command, getattr(args, 'id', None), body,
+                    getattr(args, 'stale', False))
+    except Refusal as e:
+        print(e, file=stderr)
+        return 1
+    if reply != '':
+        print(reply, file=stdout)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))

@@ -1,0 +1,30 @@
+{
+  "name": "tidy",
+  "version": "0.3.3",
+  "description": "Gives the model a tool to compact its own context, suggests compacting at boundaries, and keeps the prompt cache warm while background work runs.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "compactNudgeTokens": {
+      "type": "number",
+      "title": "Compaction reminder size",
+      "description": "Tidy suggests compacting at a boundary (after recorded work, or as a wait starts) when the context is at least this many tokens. 0 turns suggestions off. Autocompact still handles overflow.",
+      "default": 300000
+    },
+    "cacheTtlMinutes": {
+      "type": "number",
+      "title": "Cache lifetime",
+      "description": "Prompt-cache lifetime in minutes, overriding the one tidy detects. Leave empty to detect it as Claude Code chooses it; set 5 if you usually draw extra usage, which drops the cache to five minutes. Tidy keeps a waiting session's cache warm by reading it just before this lifetime ends. 0 turns keep-alive off."
+    },
+    "keepaliveBudget": {
+      "type": "number",
+      "title": "Keep-alive budget",
+      "description": "Spending cap for keep-alive in one wait, counted in full cache writes: once its cache reads would cost this many writes, tidy lets the cache expire. 0 turns keep-alive off.",
+      "default": 1
+    }
+  },
+  "author": {
+    "name": "jmcarthur"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/jmcarthur/claude-plugins"
+}

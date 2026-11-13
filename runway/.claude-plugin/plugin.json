@@ -1,0 +1,43 @@
+{
+  "name": "runway",
+  "version": "0.4.5",
+  "description": "Switches subscriptions with claude-swap before a usage limit stops the work, resumes a session that a limit stopped, and, with tidy, suggests compacting before a long limit.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "compactBeforeLimitTokens": {
+      "type": "number",
+      "title": "Compaction reminder size before a limit",
+      "description": "Runway suggests compacting before a usage limit that resets after the prompt cache expires when the context is at least this many tokens, and only while tidy's compact tool is loaded. 0 turns the suggestion off.",
+      "default": 300000
+    },
+    "switching": {
+      "type": "boolean",
+      "title": "Account switching",
+      "description": "Switch to another account that claude-swap manages before a usage limit stops the work.",
+      "default": true
+    },
+    "switchMaxWaitMinutes": {
+      "type": "number",
+      "title": "Switch lead time",
+      "description": "Runway switches accounts when a usage window, at its current burn rate, would reach 99% within this many minutes plus a 5-minute margin. A target account must not be that close to a limit itself.",
+      "default": 30
+    },
+    "remoteControlRestore": {
+      "type": "boolean",
+      "title": "Restore Remote Control",
+      "description": "Reconnect Remote Control after an account switch drops it.",
+      "default": true
+    },
+    "notifications": {
+      "type": "boolean",
+      "title": "Notifications",
+      "description": "Send a desktop notification when account switching fails.",
+      "default": true
+    }
+  },
+  "author": {
+    "name": "jmcarthur"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/jmcarthur/claude-plugins"
+}

@@ -1,0 +1,5 @@
+# Claude Code plugin types, regenerated whenever a plugin loads from its folder
+**/.claude-plugin/types/
+__pycache__/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

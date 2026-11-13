@@ -1,0 +1,10 @@
+{
+  "name": "rootcause",
+  "version": "0.12.5",
+  "description": "A subagent that finds the root causes of a defect one question at a time, before the session fixes it.",
+  "author": {
+    "name": "jmcarthur"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/jmcarthur/claude-plugins"
+}

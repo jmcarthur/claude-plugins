@@ -1,0 +1,37 @@
+#!/bin/sh
+# Type-check a plugin's TypeScript: sh bin/typecheck [plugin dir ...] (default: rootcause runway threads tidy).
+# The tsconfig in each plugin extends .claude-plugin/types/, which Claude Code writes only
+# in an interactive session and which is not in the repo. So this uses the engine
+# declarations (claude-code.d.ts) that the bundled plugin-authoring skill unpacks under
+# $TMPDIR/claude-$UID/bundled-skills/<version>/<hash>/ when a session loads it, and the
+# compiler options that Claude Code uses. It needs node and network (or an npm cache) for
+# `npx typescript`; nothing is installed globally.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+decl=$(ls -t "${TMPDIR:-/tmp}"/claude-"$(id -u)"/bundled-skills/*/*/plugin-authoring/types/claude-code.d.ts 2>/dev/null | head -n 1 || true)
+if [ -z "$decl" ]; then
+  echo "typecheck: no claude-code.d.ts found. Start a Claude Code session and invoke the plugin-authoring skill, then retry." >&2
+  exit 2
+fi
+[ $# -gt 0 ] || set -- rootcause runway threads tidy
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+status=0
+for dir in "$@"; do
+  d=$(cd "$root/$dir" && pwd)
+  cat > "$tmp/tsconfig.json" <<JSON
+{
+  "compilerOptions": {
+    "target": "es2023", "lib": ["es2023"], "types": [],
+    "module": "esnext", "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true, "skipLibCheck": true,
+    "jsx": "react", "jsxFactory": "h", "jsxFragmentFactory": "Fragment"
+  },
+  "include": ["$decl", "$d/hooks", "$d/types", "$d/tests"]
+}
+JSON
+  echo "typecheck: $dir (declarations: $decl)"
+  npx --yes -p typescript tsc -p "$tmp/tsconfig.json" || status=1
+done
+exit $status

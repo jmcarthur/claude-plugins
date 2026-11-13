@@ -1,0 +1,2793 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rootcause</title>
+    <!--
+  The rootcause web UI: one page for the three views that `rootcause serve`
+  routes to it. / lists every analysis, newest first or by session, /s/<session>
+  one session's analyses, /a/<id> one analysis as a graph. It reads the
+  server's JSON (/api/...) and refetches what changed when /events says so.
+  No dependencies: vanilla JS and SVG.
+-->
+    <style>
+      :root {
+        --bg: #f7f7f5;
+        --surface: #ffffff;
+        --fg: #1d1f23;
+        --muted: #646a73;
+        --line: #c9ccd1;
+        --soft: #eceef1;
+        --accent: #2f6fd6;
+        --bad: #b3261e;
+        --good: #1f7a3d;
+        --warn: #9a6200;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 4px 16px rgba(0, 0, 0, 0.06);
+        --mono:
+          ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+        --sans:
+          system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+          sans-serif;
+        color-scheme: light;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #15171b;
+          --surface: #1d2025;
+          --fg: #e6e7ea;
+          --muted: #9aa0a9;
+          --line: #3a3f47;
+          --soft: #262a30;
+          --accent: #7aa7ff;
+          --bad: #ff8a80;
+          --good: #7bd88f;
+          --warn: #ffc56b;
+          --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
+          color-scheme: dark;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.5 var(--sans);
+        display: flex;
+        flex-direction: column;
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      code {
+        font-family: var(--mono);
+        font-size: 0.9em;
+        background: var(--soft);
+        padding: 0.08em 0.35em;
+        border-radius: 4px;
+        overflow-wrap: anywhere;
+      }
+
+      header.bar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 18px;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface);
+        flex: none;
+      }
+      header.bar .crumbs {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        min-width: 0;
+        flex: 1;
+      }
+      header.bar .crumbs > * {
+        white-space: nowrap;
+      }
+      header.bar .crumbs .sep {
+        color: var(--muted);
+      }
+      header.bar .brand {
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      .seg {
+        display: inline-flex;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        overflow: hidden;
+        font-size: 12px;
+        flex: none;
+      }
+      .seg button {
+        font: inherit;
+        background: var(--surface);
+        color: var(--muted);
+        border: 0;
+        padding: 2px 10px;
+        cursor: pointer;
+      }
+      .seg button + button {
+        border-left: 1px solid var(--line);
+      }
+      .seg button.on {
+        background: var(--accent);
+        color: var(--surface);
+        font-weight: 600;
+      }
+      .live {
+        font-size: 12px;
+        color: var(--muted);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+      }
+      .live::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .live.on::before {
+        background: var(--good);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 25%, transparent);
+      }
+      .live.off::before {
+        background: var(--bad);
+      }
+
+      main {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+      }
+      .page {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 28px 22px 60px;
+      }
+      .page h1 {
+        font-size: 22px;
+        margin: 0 0 4px;
+      }
+      .page .sub {
+        color: var(--muted);
+        margin: 0 0 22px;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: var(--shadow);
+        margin-bottom: 14px;
+      }
+      .card > .top {
+        padding: 12px 16px;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: baseline;
+        border-bottom: 1px solid var(--line);
+      }
+      .card > .top .id {
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+      .card > .top .when {
+        color: var(--muted);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .card.fold > .top {
+        cursor: pointer;
+        user-select: none;
+        justify-content: flex-start;
+      }
+      .card.fold > .top > .when:last-child {
+        margin-left: auto;
+      }
+      .card.fold > .top::before {
+        content: "▸";
+        color: var(--muted);
+        transition: transform 0.15s;
+      }
+      .card.fold.open > .top::before {
+        transform: rotate(90deg);
+      }
+      .card.fold:not(.open) > .top {
+        border-bottom: 0;
+      }
+      .card.fold:not(.open) > .rows {
+        display: none;
+      }
+      .rows {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .rows li {
+        display: grid;
+        grid-template-columns: 96px 1fr auto;
+        gap: 14px;
+        align-items: baseline;
+        padding: 10px 16px;
+        border-top: 1px solid var(--soft);
+      }
+      .rows li:first-child {
+        border-top: 0;
+      }
+      .rows li .chip {
+        justify-self: start;
+      }
+      .rows li .sym {
+        overflow-wrap: anywhere;
+      }
+      .more {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 400;
+        white-space: nowrap;
+      }
+      .rows li .from {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .rows li .from a {
+        color: inherit;
+      }
+      .rows li .from code {
+        font-size: 12px;
+      }
+      .rows li .meta {
+        color: var(--muted);
+        font-size: 13px;
+        white-space: nowrap;
+        text-align: right;
+      }
+      .fresh-row {
+        animation: rowflash 3s ease-out;
+      }
+      @keyframes rowflash {
+        from {
+          background: color-mix(in srgb, var(--accent) 22%, transparent);
+        }
+        to {
+          background: transparent;
+        }
+      }
+      .empty {
+        color: var(--muted);
+        padding: 30px 0;
+      }
+
+      .chip {
+        display: inline-block;
+        font-size: 11px;
+        line-height: 16px;
+        padding: 0 7px;
+        border-radius: 9px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+        background: var(--surface);
+        white-space: nowrap;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      .chip.open {
+        color: var(--accent);
+        border-color: currentColor;
+      }
+      .chip.concluded {
+        color: var(--good);
+        border-color: currentColor;
+      }
+      .chip.abandoned {
+        color: var(--muted);
+      }
+      .chip.hypothesis {
+        color: var(--warn);
+        border-color: currentColor;
+        border-style: dashed;
+      }
+      .chip.refuted {
+        color: var(--bad);
+        border-color: currentColor;
+      }
+      .chip.checked {
+        color: var(--good);
+        border-color: currentColor;
+      }
+      .chip.supported {
+        color: var(--accent);
+        border-color: currentColor;
+        border-style: dotted;
+        border-width: 2px;
+        line-height: 14px;
+      }
+      .chip.unproven {
+        color: var(--warn);
+        border-color: currentColor;
+      }
+      .chip.fix {
+        color: #fff;
+        background: var(--good);
+        border-color: var(--good);
+      }
+      .chip.estimated {
+        font-weight: 400;
+      }
+
+      /* The analysis view */
+      .graph {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        cursor: grab;
+        touch-action: none;
+      }
+      .graph.dragging {
+        cursor: grabbing;
+      }
+      .graph svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+        user-select: none;
+      }
+      .title {
+        position: absolute;
+        left: 16px;
+        top: 14px;
+        right: 330px;
+        pointer-events: none;
+      }
+      .title h1 {
+        font-size: 18px;
+        line-height: 1.35;
+        margin: 0;
+        max-width: 820px;
+        pointer-events: auto;
+      }
+      .title .sub {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 13px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        pointer-events: auto;
+      }
+      .tools {
+        position: absolute;
+        right: 16px;
+        top: 14px;
+        display: flex;
+        gap: 6px;
+      }
+      .tools button {
+        font: inherit;
+        font-size: 13px;
+        background: var(--surface);
+        color: var(--fg);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 4px 10px;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .tools button:hover {
+        border-color: var(--accent);
+      }
+      .legend {
+        position: absolute;
+        left: 16px;
+        bottom: 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 8px 12px 6px;
+        box-shadow: var(--shadow);
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .legend .ramp {
+        width: 240px;
+        height: 10px;
+        border-radius: 5px;
+        margin: 5px 0 3px;
+      }
+      .legend .ends {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      .legend .keys {
+        margin-top: 6px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .legend .keys svg {
+        vertical-align: middle;
+      }
+
+      .node {
+        cursor: pointer;
+      }
+      .node .box {
+        stroke-width: 1.5;
+      }
+      .node:hover .box {
+        stroke-width: 2.5;
+      }
+      .node.hypothesis .box {
+        stroke-dasharray: 6 4;
+      }
+      .node.supported .box {
+        stroke-dasharray: 0.5 4.5;
+        stroke-linecap: round;
+        stroke-width: 3;
+      }
+      .node.supported:hover .box {
+        stroke-width: 4;
+      }
+      .node.evidence .tag {
+        stroke: var(--good);
+        stroke-width: 1.5;
+      }
+      .node.evidence:hover .tag {
+        stroke-width: 2.5;
+      }
+      .nbox.ev {
+        font-size: 11.5px;
+        line-height: 1.25;
+        gap: 1px;
+      }
+      .nbox.ev .step {
+        color: var(--good);
+      }
+      .nbox.ev .ntext {
+        -webkit-line-clamp: 2;
+        color: var(--muted);
+      }
+      .cite-edge {
+        fill: none;
+        stroke: var(--good);
+        stroke-width: 1.5;
+        stroke-dasharray: 2 3;
+      }
+      .node.refuted {
+        opacity: 0.55;
+      }
+      .node.refuted .ntext {
+        text-decoration: line-through;
+      }
+      .node.fixed .box {
+        stroke-width: 3;
+      }
+      .node.fresh .halo {
+        animation: halo 4s ease-out forwards;
+      }
+      .node .halo {
+        fill: none;
+        stroke: var(--accent);
+        stroke-width: 0;
+        opacity: 0;
+      }
+      @keyframes halo {
+        0% {
+          stroke-width: 10;
+          opacity: 0.7;
+        }
+        100% {
+          stroke-width: 0;
+          opacity: 0;
+        }
+      }
+      .nbox {
+        font: 13px/1.32 var(--sans);
+        color: var(--fg);
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        overflow: hidden;
+      }
+      .nbox .nhead {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+        flex-wrap: nowrap;
+        overflow: hidden;
+      }
+      .nbox .step {
+        font: 700 12px var(--mono);
+        margin-right: 2px;
+      }
+      .nbox .ntext {
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        overflow-wrap: anywhere;
+      }
+      .nbox.symptom .ntext {
+        font-weight: 650;
+        font-size: 14px;
+        -webkit-line-clamp: 3;
+      }
+      .nbox .kicker {
+        font: 700 10px var(--sans);
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .edge {
+        fill: none;
+        stroke: var(--muted);
+        stroke-width: 1.4;
+      }
+      .same-edge {
+        fill: none;
+        stroke: var(--accent);
+        stroke-width: 1.6;
+        stroke-dasharray: 5 4;
+      }
+      .badge rect {
+        fill: var(--surface);
+        stroke: var(--muted);
+      }
+      .badge text {
+        font: 700 10px var(--sans);
+        fill: var(--fg);
+        letter-spacing: 0.06em;
+      }
+      .pill rect {
+        fill: var(--surface);
+        stroke: var(--accent);
+        stroke-dasharray: 5 4;
+      }
+      .pill text {
+        font: 12px var(--mono);
+        fill: var(--accent);
+      }
+      .tools button.on {
+        background: var(--accent);
+        color: var(--surface);
+        border-color: var(--accent);
+      }
+
+      /* The outline and matrix layouts: the analysis as a page, without a graph */
+      .flat {
+        position: absolute;
+        inset: 0;
+        overflow: auto;
+      }
+      .flat[hidden] {
+        display: none;
+      }
+      .flat .page {
+        max-width: 1100px;
+      }
+      .flat .ftitle h1 {
+        font-size: 20px;
+        line-height: 1.35;
+      }
+      .flat .ftitle .sub {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        font-size: 13px;
+      }
+      .flat .ftools {
+        display: flex;
+        gap: 6px;
+        margin: -8px 0 14px;
+      }
+      .flat .ftools button {
+        font: inherit;
+        font-size: 13px;
+        background: var(--surface);
+        color: var(--fg);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 3px 10px;
+        cursor: pointer;
+      }
+      .flat .ftools button:hover {
+        border-color: var(--accent);
+      }
+      .flat h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 26px 0 8px;
+      }
+      .outline,
+      .outline ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .outline ul {
+        margin-left: 13px;
+        padding-left: 16px;
+        border-left: 1px solid var(--line);
+      }
+      .orow {
+        display: grid;
+        grid-template-columns: 16px auto 1fr;
+        gap: 4px 8px;
+        align-items: baseline;
+        padding: 6px 8px;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+      .orow:hover {
+        background: var(--soft);
+      }
+      .orow .caret {
+        color: var(--muted);
+        width: 16px;
+        text-align: center;
+        user-select: none;
+      }
+      .orow .caret.leaf {
+        visibility: hidden;
+      }
+      .orow .step {
+        font: 700 13px var(--mono);
+        white-space: nowrap;
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .orow .swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 3px;
+        display: inline-block;
+        flex: none;
+      }
+      .orow .body {
+        min-width: 0;
+      }
+      .orow .body .chips {
+        display: inline-flex;
+        gap: 4px;
+        flex-wrap: wrap;
+        margin-right: 6px;
+        vertical-align: 1px;
+      }
+      .orow.symptom .body {
+        font-weight: 650;
+        font-size: 16px;
+      }
+      .orow.refuted .text {
+        text-decoration: line-through;
+        color: var(--muted);
+      }
+      .orow.hypothesis .step {
+        font-style: italic;
+      }
+      .orow .cites {
+        display: block;
+        margin-top: 3px;
+      }
+      .orow .comb {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+      .evchip {
+        display: inline-block;
+        font: 600 11px/16px var(--mono);
+        padding: 0 5px;
+        margin: 0 3px 2px 0;
+        border-radius: 4px;
+        color: var(--good);
+        border: 1px solid color-mix(in srgb, var(--good) 45%, transparent);
+        cursor: pointer;
+      }
+      .evchip:hover {
+        background: color-mix(in srgb, var(--good) 14%, transparent);
+      }
+      .closed > ul {
+        display: none;
+      }
+      .evlist {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .evlist li {
+        display: grid;
+        grid-template-columns: 44px 1fr;
+        gap: 10px;
+        padding: 6px 8px;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+      .evlist li:hover {
+        background: var(--soft);
+      }
+      .evlist .by {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .matrix {
+        border-collapse: separate;
+        border-spacing: 0;
+        font-size: 13px;
+      }
+      .matrix th,
+      .matrix td {
+        padding: 0;
+      }
+      .matrix thead th {
+        position: sticky;
+        top: 0;
+        background: var(--bg);
+        z-index: 1;
+        height: 64px;
+        vertical-align: bottom;
+      }
+      .matrix thead th.ev {
+        width: 26px;
+        cursor: pointer;
+      }
+      .matrix thead th.ev span {
+        display: inline-block;
+        writing-mode: vertical-rl;
+        transform: rotate(180deg);
+        font: 600 11px var(--mono);
+        color: var(--good);
+        padding: 4px 0;
+      }
+      .matrix th.row {
+        position: sticky;
+        left: 0;
+        background: var(--bg);
+        text-align: left;
+        font-weight: 400;
+        max-width: 460px;
+        min-width: 300px;
+        z-index: 1;
+        cursor: pointer;
+      }
+      .matrix th.row div {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        padding: 3px 10px 3px 0;
+      }
+      .matrix th.row .step {
+        font: 700 12px var(--mono);
+        margin-right: 6px;
+      }
+      .matrix tr.refuted th.row {
+        color: var(--muted);
+        text-decoration: line-through;
+      }
+      .matrix td {
+        width: 26px;
+        height: 24px;
+        text-align: center;
+        border-left: 1px solid var(--soft);
+        border-top: 1px solid var(--soft);
+      }
+      .matrix td.on::after {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--good);
+        vertical-align: middle;
+      }
+      .matrix tr.refuted td.on::after {
+        background: var(--line);
+      }
+      .matrix tbody tr:hover th.row,
+      .matrix tbody tr:hover td {
+        background: var(--soft);
+      }
+      .matrix td.hot,
+      .matrix th.hot {
+        background: color-mix(
+          in srgb,
+          var(--accent) 12%,
+          transparent
+        ) !important;
+      }
+      .matrix tfoot td {
+        color: var(--muted);
+        font-size: 11px;
+        border: 0;
+        padding-top: 4px;
+      }
+      .matrix tfoot th {
+        text-align: right;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 400;
+        padding: 4px 10px 0 0;
+        position: sticky;
+        left: 0;
+        background: var(--bg);
+      }
+
+      .report {
+        position: absolute;
+        right: 16px;
+        top: 54px;
+        bottom: 14px;
+        width: 330px;
+        overflow: auto;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: var(--shadow);
+        padding: 4px 16px 14px;
+        font-size: 14px;
+      }
+      .report.closed {
+        bottom: auto;
+        overflow: hidden;
+      }
+      .report.closed > :not(h2) {
+        display: none;
+      }
+      .report h2 {
+        font-size: 14px;
+        margin: 10px 0 6px;
+        display: flex;
+        justify-content: space-between;
+        cursor: pointer;
+      }
+      .report h3 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 14px 0 6px;
+      }
+      .report ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      .report li {
+        margin: 0 0 8px;
+        line-height: 1.5;
+      }
+      .report .steplink {
+        font: 700 12px var(--mono);
+        cursor: pointer;
+        color: var(--accent);
+      }
+
+      /* The modal: one node's full record, as a document */
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 12, 16, 0.45);
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 5vh 16px;
+        z-index: 10;
+        overflow: auto;
+      }
+      .overlay[hidden] {
+        display: none;
+      }
+      .doc {
+        background: var(--surface);
+        color: var(--fg);
+        border-radius: 12px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+        width: min(760px, 100%);
+        padding: 26px 34px 30px;
+        position: relative;
+        font-size: 16px;
+        line-height: 1.65;
+      }
+      .doc .close {
+        position: absolute;
+        right: 14px;
+        top: 12px;
+        border: 0;
+        background: none;
+        color: var(--muted);
+        font-size: 22px;
+        cursor: pointer;
+        line-height: 1;
+        padding: 6px;
+      }
+      .doc .close:hover {
+        color: var(--fg);
+      }
+      .doc .kick {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 6px;
+      }
+      .doc .kick .step {
+        font: 700 14px var(--mono);
+      }
+      .doc .swatch {
+        width: 14px;
+        height: 14px;
+        border-radius: 4px;
+        display: inline-block;
+      }
+      .doc h2 {
+        font-size: 22px;
+        line-height: 1.35;
+        margin: 4px 0 18px;
+        font-weight: 650;
+      }
+      .doc h2.struck {
+        text-decoration: line-through;
+        color: var(--muted);
+      }
+      .doc section {
+        margin: 0 0 16px;
+      }
+      .doc section > h3 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 0 0 3px;
+        font-weight: 700;
+      }
+      .doc section p {
+        margin: 0 0 0.5em;
+      }
+      .doc ul {
+        margin: 0;
+        padding-left: 22px;
+      }
+      .doc li {
+        margin: 0 0 0.35em;
+      }
+      .doc .two {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0 26px;
+      }
+      .doc .times {
+        color: var(--muted);
+        font-size: 14px;
+        border-top: 1px solid var(--soft);
+        padding-top: 12px;
+        margin-top: 20px;
+      }
+      .doc a.jump {
+        font-family: var(--mono);
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .doc .note {
+        color: var(--muted);
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="bar">
+      <nav class="crumbs" id="crumbs">
+        <a class="brand" href="/">rootcause</a>
+      </nav>
+      <span class="live" id="live">connecting</span>
+    </header>
+    <main id="main"></main>
+    <div class="overlay" id="overlay" hidden>
+      <article class="doc" id="doc" role="dialog" aria-modal="true"></article>
+    </div>
+    <script>
+      "use strict";
+
+      // ---------- small helpers ----------
+
+      const $ = (sel, root = document) => root.querySelector(sel);
+      const esc = (s) =>
+        String(s ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      const SVG = "http://www.w3.org/2000/svg";
+      const el = (name, attrs = {}, parent) => {
+        const e = document.createElementNS(SVG, name);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+        if (parent) parent.appendChild(e);
+        return e;
+      };
+      const getJSON = async (url) => {
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) throw new Error(`${url}: ${r.status}`);
+        return r.json();
+      };
+
+      const when = (iso) => {
+        if (!iso) return "";
+        const d = new Date(iso);
+        const today = new Date().toDateString() === d.toDateString();
+        return today
+          ? d.toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            })
+          : d.toLocaleString([], {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            });
+      };
+      const ago = (iso) => {
+        if (!iso) return "";
+        const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+        if (s < 60) return `${Math.round(s)} s ago`;
+        if (s < 3600) return `${Math.round(s / 60)} min ago`;
+        if (s < 86400) return `${(s / 3600).toFixed(s < 36000 ? 1 : 0)} h ago`;
+        return `${Math.round(s / 86400)} d ago`;
+      };
+      const shortId = (s) => (s.length > 12 ? s.slice(0, 8) : s);
+
+      // Text the agent wrote: paragraphs per line, `backticks` and things that look
+      // like code (paths, file:line, calls, --flags) in monospace.
+      const CODEISH =
+        /((?:[\w.~-]+\/)+[\w.-]*|[\w-]+\.(?:py|ts|tsx|js|mjs|json|md|sh|c|h|cc|cpp|rs|go|hs|ml|toml|ya?ml|txt|log|html|css)(?::\d+(?:-\d+)?)?\b|\b[A-Za-z_$][\w$.]*\(\)|(?<![\w-])--?[a-z][\w-]+)/g;
+      const inline = (s) =>
+        String(s)
+          .split(/(`[^`]+`)/)
+          .map((part) =>
+            part.startsWith("`") && part.endsWith("`") && part.length > 2
+              ? `<code>${esc(part.slice(1, -1))}</code>`
+              : esc(part).replace(CODEISH, (m) =>
+                  /^-+$/.test(m) ? m : `<code>${m}</code>`,
+                ),
+          )
+          .join("");
+      const prose = (s) =>
+        String(s ?? "")
+          .split(/\n+/)
+          .filter((l) => l.trim())
+          .map((l) => `<p>${inline(l)}</p>`)
+          .join("");
+
+      const STATUS = {
+        checked: "Checked: seen directly",
+        supported:
+          "Supported: backed by evidence, but not proven, because the check that would prove it cannot be run",
+        hypothesis: "Hypothesis: inferred, not yet checked",
+        refuted: "Ruled out by a check",
+      };
+      const REACH = {
+        changeable: "Changeable: its own causes are walked",
+        fix: "Fix: where to change it",
+        design:
+          "Design: works as an earlier session or author designed it, and the design may be the mistake",
+        outside: "Outside reach",
+        decision: "A decision the user made or asked for",
+        needed: "Needed: what its purpose needs",
+        stop: "Stop: left alone, with a reason",
+      };
+      const FIX = {
+        removes: "The change removes the cause.",
+        "removes-and-guards": "The change removes the cause and adds a guard.",
+        hides: "The change only hides the cause.",
+      };
+      const COMBINE = {
+        all: "All are needed together",
+        any: "Any one is enough",
+        parts: "Each makes part of it",
+      };
+      const BADGE = { all: "ALL", any: "ANY", parts: "PARTS" };
+
+      // ---------- live updates ----------
+
+      const listeners = [];
+      function connect() {
+        const live = $("#live");
+        const source = new EventSource("/events");
+        source.onopen = () => {
+          live.className = "live on";
+          live.textContent = "live";
+        };
+        source.onerror = () => {
+          live.className = "live off";
+          live.textContent = "reconnecting";
+        };
+        source.onmessage = (ev) => {
+          const changed = JSON.parse(ev.data);
+          for (const f of listeners) f(changed);
+        };
+      }
+
+      function crumbs(items) {
+        $("#crumbs").innerHTML =
+          '<a class="brand" href="/">rootcause</a>' +
+          items
+            .map(
+              ([text, href]) =>
+                `<span class="sep">/</span>${href ? `<a href="${esc(href)}">${esc(text)}</a>` : `<span>${esc(text)}</span>`}`,
+            )
+            .join("");
+      }
+
+      // ---------- the listings ----------
+
+      const statusChip = (s) => `<span class="chip ${esc(s)}">${esc(s)}</span>`;
+      // A session by its name when Claude Code gave it one, else by its short id, and where it ran.
+      const home = (p) => (p || "").replace(/^\/home\/[^/]+(?=\/|$)/, "~");
+      const sessionName = (s, info) =>
+        info && info.name ? info.name : `session ${shortId(s)}`;
+      const sessionLink = (s, info) =>
+        s === "none"
+          ? "no session"
+          : `<a href="/s/${esc(s)}" title="${esc(s)}${info && info.cwd ? ` · ${esc(info.cwd)}` : ""}">${esc(sessionName(s, info))}</a>`;
+      const analysisRow = (a, fresh, session, info) =>
+        `<li class="${fresh ? "fresh-row" : ""}">${statusChip(a.status)}<span><a class="sym" href="/a/${esc(a.id)}">${esc(a.symptom)}</a>${a.more ? ` <span class="more">and ${a.more} more</span>` : ""}${session === undefined ? "" : `<span class="from">${sessionLink(session, info)}${info && info.cwd ? ` · <code>${esc(home(info.cwd))}</code>` : ""}</span>`}</span>` +
+        `<span class="meta" title="${esc(a.started)}">${esc(when(a.started))} · ${a.steps} step${a.steps === 1 ? "" : "s"}</span></li>`;
+
+      async function sessionsView() {
+        crumbs([]);
+        document.title = "rootcause";
+        let seen = null;
+        const open = new Set(
+          JSON.parse(sessionStorage.getItem("rootcause.open") || "[]"),
+        );
+        const draw = async () => {
+          const rows = await getJSON("/api/sessions");
+          const ids = new Set(rows.flatMap((r) => r.analyses.map((a) => a.id)));
+          // Two views, switched by the toggle and remembered: every analysis in one list newest first,
+          // each with a link to its session, or one card per session, collapsed until clicked.
+          const grouped =
+            localStorage.getItem("rootcause.index") === "sessions";
+          const toggle = `<p class="sub">${[
+            ["list", "Newest first"],
+            ["sessions", "By session"],
+          ]
+            .map(([k, label]) =>
+              (k === "sessions") === grouped
+                ? `<b>${label}</b>`
+                : `<a href="#" data-index="${k}">${label}</a>`,
+            )
+            .join(" · ")} · Updates live.</p>`;
+          const all = rows
+            .flatMap((r) =>
+              r.analyses.map((a) => [a, r.session, (r.info || {})[r.session]]),
+            )
+            .sort(([a], [b]) =>
+              (b.started || "").localeCompare(a.started || ""),
+            );
+          $("#main").innerHTML =
+            `<div class="page"><h1>Root cause analyses</h1>${toggle}` +
+            (rows.length === 0
+              ? '<p class="empty">No analyses yet.</p>'
+              : !grouped
+                ? `<div class="card"><ul class="rows">${all.map(([a, session, info]) => analysisRow(a, seen && !seen.has(a.id), session, info)).join("")}</ul></div>`
+                : rows
+                    .map((r) => {
+                      const latest = r.analyses.reduce(
+                        (m, a) => (a.started > m ? a.started : m),
+                        "",
+                      );
+                      const info = (r.info || {})[r.session];
+                      const name =
+                        r.session === "none"
+                          ? "Not tied to a session"
+                          : `${info && info.name ? `${esc(info.name)} ` : "Session "}<span class="id">${esc(shortId(r.session))}</span>${info && info.cwd ? ` <span class="when">${esc(home(info.cwd))}</span>` : ""}`;
+                      const also =
+                        r.sessions.length > 1
+                          ? ` <span class="when">continued as ${r.sessions
+                              .filter((s) => s !== r.session)
+                              .map((s) => esc(shortId(s)))
+                              .join(", ")}</span>`
+                          : "";
+                      const isOpen =
+                        open.has(r.session) ||
+                        r.analyses.some(
+                          (a) => seen && !seen.has(a.id) && open.add(r.session),
+                        );
+                      return (
+                        `<div class="card fold${isOpen ? " open" : ""}" data-fold="${esc(r.session)}"><div class="top"><a href="/s/${esc(r.session)}">${name}</a>${also}<span class="when">${r.analyses.length} analys${r.analyses.length === 1 ? "is" : "es"} · latest ${esc(ago(latest))}</span></div>` +
+                        `<ul class="rows">${r.analyses.map((a) => analysisRow(a, seen && !seen.has(a.id))).join("")}</ul></div>`
+                      );
+                    })
+                    .join("")) +
+            "</div>";
+          // Session cards start collapsed; a click on the header (not its link) opens or closes one, and
+          // the open set lasts for the tab so live redraws and the back button keep it.
+          for (const card of document.querySelectorAll("[data-fold]"))
+            $(".top", card).onclick = (ev) => {
+              if (ev.target.closest("a")) return;
+              const k = card.dataset.fold;
+              card.classList.toggle("open") ? open.add(k) : open.delete(k);
+              sessionStorage.setItem(
+                "rootcause.open",
+                JSON.stringify([...open]),
+              );
+            };
+          for (const el of document.querySelectorAll("[data-index]"))
+            el.onclick = (ev) => {
+              ev.preventDefault();
+              localStorage.setItem("rootcause.index", el.dataset.index);
+              draw();
+            };
+          seen = ids;
+        };
+        await draw();
+        listeners.push(() => draw());
+      }
+
+      async function sessionView(id) {
+        crumbs([[`session ${shortId(id)}`]]);
+        document.title = `rootcause · session ${shortId(id)}`;
+        let named = false;
+        let seen = null;
+        const draw = async () => {
+          const s = await getJSON(`/api/s/${encodeURIComponent(id)}`);
+          const others = s.sessions.filter((x) => x !== id);
+          const info = (s.info || {})[id];
+          if (info && info.name && !named) {
+            named = true;
+            crumbs([[info.name]]);
+            document.title = `rootcause · ${info.name}`;
+          }
+          $("#main").innerHTML =
+            `<div class="page"><h1>${id === "none" ? "Analyses not tied to a session" : info && info.name ? esc(info.name) : `Session <code>${esc(id)}</code>`}</h1>` +
+            (info && (info.name || info.cwd)
+              ? `<p class="sub">${info.name ? `<code>${esc(id)}</code>` : ""}${info.name && info.cwd ? " · " : ""}${info.cwd ? `<code>${esc(home(info.cwd))}</code>` : ""}</p>`
+              : "") +
+            `<p class="sub">${others.length ? `Together with the sessions it continued as or from: ${others.map((o) => `<code>${esc(o)}</code>`).join(", ")}. ` : ""}Updates live.</p>` +
+            (s.analyses.length === 0
+              ? '<p class="empty">No analyses yet. They appear here as they start.</p>'
+              : `<div class="card"><ul class="rows">${s.analyses.map((a) => analysisRow(a, seen && !seen.has(a.id))).join("")}</ul></div>`) +
+            "</div>";
+          seen = new Set(s.analyses.map((a) => a.id));
+        };
+        await draw();
+        listeners.push(() => draw());
+      }
+
+      // ---------- the graph ----------
+
+      // Viridis, from dark violet (oldest) to yellow (newest): perceptually uniform,
+      // and readable for the common kinds of color blindness.
+      const VIRIDIS = [
+        "#440154",
+        "#482878",
+        "#3e4a89",
+        "#31688e",
+        "#26828e",
+        "#1f9e89",
+        "#35b779",
+        "#6ece58",
+        "#b5de2b",
+        "#fde725",
+      ];
+      const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+      const rgb = (c) => `rgb(${c.map(Math.round).join(",")})`;
+      const mix = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+      // A step's place in the order the steps were added, from 0 (oldest) to 1 (newest), so the colors
+      // spread evenly however the times bunch up. Steps added at the same time share a place.
+      function ageRank(nodes) {
+        const times = [
+          ...new Set(
+            nodes.map((n) => Date.parse(n.c?.added)).filter((x) => !isNaN(x)),
+          ),
+        ].sort((x, y) => x - y);
+        const rank = new Map(
+          times.map((x, i) => [
+            x,
+            times.length > 1 ? i / (times.length - 1) : 1,
+          ]),
+        );
+        return (n) => rank.get(Date.parse(n.c?.added)) ?? 1;
+      }
+
+      function viridis(t) {
+        const x = Math.min(1, Math.max(0, t)) * (VIRIDIS.length - 1);
+        const i = Math.min(VIRIDIS.length - 2, Math.floor(x));
+        return mix(hex(VIRIDIS[i]), hex(VIRIDIS[i + 1]), x - i);
+      }
+      const dark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+
+      const SIZE = {
+        symptom: [340, 82],
+        cause: [260, 88],
+        same: [104, 34],
+        evidence: [156, 54],
+        forest: [0, 0],
+      };
+      const GAP_X = 26,
+        GAP_Y = 74;
+
+      // The tree as nodes: each symptom, each cause, and each same entry as a small
+      // pill that points at its step. The first symptom is 0 (S1 too when there are
+      // more), and its steps 1, 1.2; a later symptom is S2, and its steps S2.1.
+      const symptomsOf = (a) => [
+        { symptom: a.symptom, why: a.why },
+        ...(a.moreSymptoms ?? []),
+      ];
+      function build(a) {
+        const all = symptomsOf(a),
+          several = all.length > 1;
+        const byLabel = new Map(),
+          alias = new Map();
+        const walk = (group, parent, base) => {
+          group.causes.forEach((c, i) => {
+            const label = base ? `${base}.${i + 1}` : String(i + 1);
+            const n =
+              "same" in c
+                ? {
+                    kind: "same",
+                    label,
+                    key: `${label}|same ${c.same}`,
+                    c,
+                    children: [],
+                    parent,
+                  }
+                : {
+                    kind: "cause",
+                    label,
+                    key: `${label}|${c.cause}`,
+                    c,
+                    children: [],
+                    parent,
+                    group: c.why,
+                  };
+            parent.children.push(n);
+            byLabel.set(label, n);
+            if (c.why) walk(c.why, n, label);
+          });
+        };
+        const roots = all.map((s, k) => {
+          const label = k === 0 && !several ? "0" : `S${k + 1}`;
+          const root = {
+            kind: "symptom",
+            label,
+            key: label,
+            name: several ? `S${k + 1}` : "",
+            text: s.symptom,
+            c: null,
+            children: [],
+            group: s.why,
+          };
+          byLabel.set(label, root);
+          if (s.why) walk(s.why, root, k === 0 ? "" : label);
+          return root;
+        });
+        if (several) alias.set("0", roots[0]);
+        // Evidence items, each linked to the causes that cite it. In the tree layout
+        // each hangs below the first supported cause that cites it, else the first
+        // cause, so that a supported cause is never drawn as a leaf.
+        const evidence = new Map(
+          (a.evidenceItems ?? []).map((e) => [
+            e.id,
+            {
+              kind: "evidence",
+              label: e.id,
+              key: `evidence|${e.id}|${e.text}`,
+              e,
+              citers: [],
+              children: [],
+            },
+          ]),
+        );
+        const order = [...byLabel.values()].filter((n) => n.kind === "cause");
+        for (const n of order)
+          n.cites = (n.c.cites ?? [])
+            .map((i) => evidence.get(i))
+            .filter(Boolean);
+        for (const n of order)
+          if (n.c.status !== "refuted")
+            for (const e of n.cites) e.citers.push(n);
+        for (const e of evidence.values()) {
+          e.host =
+            e.citers.find((n) => n.c.status === "supported") ?? e.citers[0];
+          if (e.host) (e.host.hang ??= []).push(e);
+        }
+        // A link may name the first symptom's steps as S1.2 as well as 1.2.
+        const find = (l) =>
+          byLabel.get(l) ??
+          alias.get(l) ??
+          evidence.get(String(l).toUpperCase()) ??
+          (/^S1\./i.test(l)
+            ? byLabel.get(l.slice(3))
+            : byLabel.get(l.toUpperCase()));
+        return {
+          root: roots[0],
+          roots,
+          byLabel,
+          evidence: [...evidence.values()],
+          find,
+        };
+      }
+
+      // Several symptoms stand side by side, under a root that is not drawn.
+      function layout(roots) {
+        const root =
+          roots.length === 1 ? roots[0] : { kind: "forest", children: roots };
+        const gap = (n) => (n.kind === "forest" ? GAP_X * 4 : GAP_X);
+        const kids = (n) => [...n.children, ...(n.hang ?? [])];
+        const width = (n) => {
+          const [w] = SIZE[n.kind];
+          n.inner =
+            kids(n).reduce((s, c) => s + width(c), 0) +
+            gap(n) * Math.max(0, kids(n).length - 1);
+          n.span = Math.max(w, n.inner);
+          return n.span;
+        };
+        let depth = 0;
+        const place = (n, left, level) => {
+          const [w, h] = SIZE[n.kind];
+          n.w = w;
+          n.h = h;
+          n.level = level;
+          n.x = left + n.span / 2;
+          n.y =
+            level * (SIZE.cause[1] + GAP_Y) +
+            (n.kind === "same" || n.kind === "evidence"
+              ? (SIZE.cause[1] - h) / 2
+              : 0);
+          depth = Math.max(depth, level);
+          let x = left + (n.span - n.inner) / 2;
+          for (const c of kids(n)) {
+            place(c, x, level + 1);
+            x += c.span + gap(n);
+          }
+        };
+        width(root);
+        place(root, 0, root.kind === "forest" ? -1 : 0);
+        // Below the last row, room for the arcs of same links.
+        return {
+          w: root.span,
+          h: (depth + 1) * (SIZE.cause[1] + GAP_Y) - GAP_Y + 70,
+        };
+      }
+
+      // The analysis as a layered DAG (Sugiyama): a same entry is no node, but an
+      // edge from its parent straight to its step, which then has several parents.
+      // Ranks are the longest path from the symptom, so a shared step sits below all
+      // its parents; an edge across several ranks runs through dummy nodes, which
+      // keep a slot free in each row it crosses; barycenter sweeps order each row;
+      // and a weighted least-squares placement that keeps each row's order (pool
+      // adjacent violators) sets x. Edges leave a node at its combine junction.
+      const DAG = { gapY: 96, row: SIZE.cause[1], junction: 20, dummy: 12 };
+      function dagLayout(tree, evidence = true) {
+        const { byLabel } = tree;
+        const resolve = (n) => {
+          let m = n;
+          for (let k = 0; m && m.kind === "same" && k < 64; k++)
+            m = byLabel.get(m.c.same);
+          return m && m.kind !== "same" ? m : null;
+        };
+        const real = [];
+        for (const n of byLabel.values()) {
+          if (n.kind === "same") {
+            n.target = resolve(n);
+            n.hidden = !!n.target;
+            if (n.hidden) continue;
+          }
+          real.push(n);
+          n.outs = [];
+          n.ins = [];
+          n.up = [];
+          n.down = [];
+          [n.w, n.h] = SIZE[n.kind];
+        }
+        for (const n of evidence ? tree.evidence : []) {
+          if (!n.citers.length) continue;
+          real.push(n);
+          n.outs = [];
+          n.ins = [];
+          n.up = [];
+          n.down = [];
+          [n.w, n.h] = SIZE.evidence;
+        }
+        const edges = [];
+        for (const n of real)
+          for (const c of n.children) {
+            const to = c.hidden ? c.target : c;
+            if (to === n || n.outs.some((e) => e.to === to)) continue;
+            const e = { from: n, to, via: c };
+            n.outs.push(e);
+            edges.push(e);
+          }
+        // An evidence item sits below every cause that cites it.
+        for (const n of real)
+          for (const ev of evidence &&
+          n.kind === "cause" &&
+          n.c.status !== "refuted"
+            ? n.cites
+            : []) {
+            const e = { from: n, to: ev, cite: true };
+            n.outs.push(e);
+            edges.push(e);
+          }
+        // Cycles cannot come from a valid record, but a same that names an ancestor
+        // would make one: such an edge is left out of the layout and drawn apart.
+        const state = new Map(),
+          post = [];
+        const dfs = (n) => {
+          state.set(n, 1);
+          for (const e of n.outs) {
+            const s = state.get(e.to);
+            if (s === 1) e.back = true;
+            else if (!s) dfs(e.to);
+          }
+          state.set(n, 2);
+          post.push(n);
+        };
+        for (const r of tree.roots) dfs(r);
+        for (const n of real) if (!state.has(n)) dfs(n);
+        for (const n of real) n.rank = 0;
+        for (const n of post.reverse())
+          for (const e of n.outs)
+            if (!e.back) e.to.rank = Math.max(e.to.rank, n.rank + 1);
+
+        // Rows in depth-first order, with a dummy for each rank that an edge skips.
+        let layers = [];
+        const put = (v) => (layers[v.rank] ??= []).push(v);
+        const placed = new Set();
+        const pre = (n) => {
+          placed.add(n);
+          put(n);
+          for (const e of n.outs) {
+            if (e.back) continue;
+            e.pts = [n];
+            for (let r = n.rank + 1; r < e.to.rank; r++) {
+              const d = {
+                dummy: true,
+                rank: r,
+                w: DAG.dummy,
+                up: [],
+                down: [],
+              };
+              put(d);
+              e.pts.push(d);
+            }
+            e.pts.push(e.to);
+            if (!placed.has(e.to)) pre(e.to);
+          }
+        };
+        for (const n of post.slice().reverse()) if (!placed.has(n)) pre(n);
+        for (let r = 0; r < layers.length; r++) layers[r] ??= [];
+        for (const e of edges)
+          if (!e.back)
+            for (let i = 0; i + 1 < e.pts.length; i++) {
+              e.pts[i].down.push(e.pts[i + 1]);
+              e.pts[i + 1].up.push(e.pts[i]);
+            }
+
+        // Crossing reduction.
+        const index = () => {
+          for (const L of layers) L.forEach((v, i) => (v.i = i));
+        };
+        const crossBetween = (r) => {
+          const segs = [];
+          for (const a of layers[r])
+            for (const b of a.down) segs.push([a.i, b.i]);
+          let c = 0;
+          for (let i = 0; i < segs.length; i++)
+            for (let j = i + 1; j < segs.length; j++)
+              if ((segs[i][0] - segs[j][0]) * (segs[i][1] - segs[j][1]) < 0)
+                c++;
+          return c;
+        };
+        const crossings = () => {
+          let c = 0;
+          for (let r = 0; r + 1 < layers.length; r++) c += crossBetween(r);
+          return c;
+        };
+        index();
+        let best = layers.map((L) => [...L]),
+          bestC = crossings();
+        for (let it = 0; it < 32 && bestC > 0; it++) {
+          const down = it % 2 === 0;
+          for (let k = 1; k < layers.length; k++) {
+            const r = down ? k : layers.length - 1 - k,
+              L = layers[r];
+            const key = new Map(
+              L.map((v) => {
+                const ns = down ? v.up : v.down;
+                return [
+                  v,
+                  ns.length ? ns.reduce((s, u) => s + u.i, 0) / ns.length : v.i,
+                ];
+              }),
+            );
+            L.sort((a, b) => key.get(a) - key.get(b) || a.i - b.i);
+            L.forEach((v, i) => (v.i = i));
+          }
+          // Transpose: swap neighbours while that removes crossings.
+          for (
+            let improved = true, guard = 0;
+            improved && guard < 20;
+            guard++
+          ) {
+            improved = false;
+            for (let r = 0; r < layers.length; r++) {
+              const L = layers[r];
+              for (let i = 0; i + 1 < L.length; i++) {
+                const local = () =>
+                  (r > 0 ? crossBetween(r - 1) : 0) +
+                  (r + 1 < layers.length ? crossBetween(r) : 0);
+                const before = local();
+                [L[i], L[i + 1]] = [L[i + 1], L[i]];
+                L[i].i = i;
+                L[i + 1].i = i + 1;
+                if (local() < before) improved = true;
+                else {
+                  [L[i], L[i + 1]] = [L[i + 1], L[i]];
+                  L[i].i = i;
+                  L[i + 1].i = i + 1;
+                }
+              }
+            }
+          }
+          const c = crossings();
+          if (c < bestC) {
+            bestC = c;
+            best = layers.map((L) => [...L]);
+          }
+        }
+        layers = best;
+        index();
+
+        // Among orders with the fewest crossings, prefer short edges: swap
+        // neighbours while that shortens the edges, with each row packed and
+        // centred, and crosses no more.
+        const sep = (a, b) =>
+          (a.w + b.w) / 2 +
+          (a.dummy && b.dummy ? 10 : a.dummy || b.dummy ? 18 : GAP_X);
+        const pack = (L) => {
+          let x = 0;
+          L.forEach((v, i) => {
+            if (i) x += sep(L[i - 1], v);
+            v.x = x;
+          });
+          const mid = x / 2;
+          for (const v of L) v.x -= mid;
+        };
+        for (const L of layers) pack(L);
+        const cost = (r) => {
+          let c =
+              (r > 0 ? crossBetween(r - 1) : 0) +
+              (r + 1 < layers.length ? crossBetween(r) : 0),
+            len = 0;
+          for (const v of layers[r])
+            for (const u of [...v.up, ...v.down]) len += Math.abs(v.x - u.x);
+          return c * 1e6 + len;
+        };
+        for (let improved = true, guard = 0; improved && guard < 30; guard++) {
+          improved = false;
+          for (let r = 0; r < layers.length; r++) {
+            const L = layers[r];
+            for (let i = 0; i + 1 < L.length; i++) {
+              const swap = () => {
+                [L[i], L[i + 1]] = [L[i + 1], L[i]];
+                L[i].i = i;
+                L[i + 1].i = i + 1;
+                pack(L);
+              };
+              const before = cost(r);
+              swap();
+              if (cost(r) < before - 0.5) improved = true;
+              else swap();
+            }
+          }
+        }
+
+        // x: each row in turn moves its items toward their neighbours' mean x, as
+        // close as its order and spacing allow.
+        const settle = (L, side) => {
+          const o = [0];
+          for (let i = 1; i < L.length; i++)
+            o[i] = o[i - 1] + sep(L[i - 1], L[i]);
+          const blocks = [];
+          L.forEach((v, i) => {
+            const ns =
+              side === "up"
+                ? v.up
+                : side === "down"
+                  ? v.down
+                  : [...v.up, ...v.down];
+            const want = ns.length
+              ? ns.reduce((s, u) => s + u.x, 0) / ns.length
+              : v.x;
+            const w = ns.length ? ns.length * (v.dummy ? 4 : 1) : 0.05;
+            blocks.push({ W: w, S: w * (want - o[i]), n: 1 });
+            while (
+              blocks.length > 1 &&
+              blocks.at(-2).S / blocks.at(-2).W >
+                blocks.at(-1).S / blocks.at(-1).W
+            ) {
+              const b = blocks.pop(),
+                a = blocks.at(-1);
+              a.W += b.W;
+              a.S += b.S;
+              a.n += b.n;
+            }
+          });
+          let i = 0;
+          for (const b of blocks)
+            for (let k = 0; k < b.n; k++, i++) L[i].x = b.S / b.W + o[i];
+        };
+        for (let it = 0; it < 12; it++) {
+          for (let r = 1; r < layers.length; r++) settle(layers[r], "up");
+          for (let r = layers.length - 2; r >= 0; r--)
+            settle(layers[r], "down");
+        }
+        for (let it = 0; it < 6; it++)
+          for (let r = 0; r < layers.length; r++) settle(layers[r], "both");
+
+        const items = layers.flat();
+        const left = Math.min(...items.map((v) => v.x - v.w / 2)),
+          right = Math.max(...items.map((v) => v.x + v.w / 2));
+        const top = (r) => r * (DAG.row + DAG.gapY);
+        for (const v of items) {
+          v.x -= left;
+          if (!v.dummy)
+            v.y =
+              top(v.rank) +
+              (v.kind === "same" || v.kind === "evidence"
+                ? (DAG.row - v.h) / 2
+                : 0);
+        }
+        // Where several edges come into one box, they enter side by side, in the
+        // order they come from.
+        for (const e of edges) if (!e.back) e.to.ins.push(e);
+        for (const n of real) {
+          const k = n.ins.length;
+          const prev = (e) => e.pts.at(-2).x;
+          n.ins.sort((a, b) => prev(a) - prev(b));
+          const step = k > 1 ? Math.min(18, (n.w - 60) / (k - 1)) : 0;
+          n.ins.forEach((e, i) => (e.entry = n.x + (i - (k - 1) / 2) * step));
+        }
+        return {
+          w: right - left,
+          h: top(layers.length - 1) + DAG.row + 20,
+          nodes: real,
+          edges,
+          top,
+          crossings: bestC,
+        };
+      }
+
+      const counted = (c) => "same" in c || c.status !== "refuted";
+
+      function chips(c) {
+        const out = [];
+        if (c.status === "hypothesis")
+          out.push('<span class="chip hypothesis">hypothesis</span>');
+        if (c.status === "refuted")
+          out.push('<span class="chip refuted">ruled out</span>');
+        if (c.status === "supported")
+          out.push('<span class="chip supported">supported</span>');
+        if ((c.status === "checked" || c.status === "supported") && c.reach) {
+          const fixLike =
+            c.reach === "fix" ||
+            (c.reach === "design" && c.verdict === "change");
+          const text =
+            c.reach === "fix"
+              ? `fix · ${c.fix}`
+              : c.reach === "design"
+                ? `design · ${c.verdict}`
+                : c.reach;
+          out.push(
+            `<span class="chip ${fixLike ? "fix" : ""}">${esc(text)}</span>`,
+          );
+        } else if (c.status === "hypothesis" && c.reach)
+          out.push(`<span class="chip">${esc(c.reach)}</span>`);
+        if (c.weight) out.push(`<span class="chip">${esc(c.weight)}</span>`);
+        if (c.share) out.push(`<span class="chip">${esc(c.share)}</span>`);
+        return out.join("");
+      }
+
+      async function analysisView(id) {
+        document.title = `rootcause · ${id}`;
+        $("#main").innerHTML =
+          `<div class="graph" id="graph"><svg id="svg"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs><g id="view"></g></svg></div>` +
+          `<div class="title" id="title"></div><div class="tools"><button id="fit" title="Fit to screen (F)">Fit</button><button id="zin" title="Zoom in (+)">+</button><button id="zout" title="Zoom out (−)">−</button></div>` +
+          `<div class="legend" id="legend"></div><aside class="report" id="report" hidden></aside><div class="flat" id="flat" hidden></div>`;
+        const svg = $("#svg"),
+          view = $("#view"),
+          graph = $("#graph");
+        // Four renderings of the same analysis, switched in the header without a
+        // reload: ?layout=dag (the default) and ?layout=tree draw a graph;
+        // ?layout=outline is the steps as an indented page, their evidence as tags;
+        // ?layout=matrix is which step cites which evidence item. The graphs leave
+        // evidence out unless ?evidence=on.
+        const MODES = ["tree", "dag", "outline", "matrix"];
+        const params = new URLSearchParams(location.search);
+        let mode = MODES.includes(params.get("layout"))
+          ? params.get("layout")
+          : "dag";
+        let showEvidence = params.get("evidence") === "on";
+        const flatMode = () => mode === "outline" || mode === "matrix";
+        const seg = document.createElement("span");
+        seg.className = "seg";
+        seg.title =
+          "Layout: a tree with links to shared steps, a DAG, an outline, or a matrix of citations (L)";
+        seg.innerHTML =
+          '<button data-mode="tree">Tree</button><button data-mode="dag">DAG</button><button data-mode="outline">Outline</button><button data-mode="matrix">Matrix</button>';
+        $("header.bar").insertBefore(seg, $("#live"));
+        const showMode = () => {
+          for (const b of seg.children)
+            b.classList.toggle("on", b.dataset.mode === mode);
+        };
+        const setMode = (m) => {
+          if (m === mode) return;
+          mode = m;
+          const u = new URL(location.href);
+          if (mode !== "dag") u.searchParams.set("layout", mode);
+          else u.searchParams.delete("layout");
+          history.replaceState(null, "", u);
+          showMode();
+          fitted = false;
+          draw();
+        };
+        showMode();
+        for (const b of seg.children) b.onclick = () => setMode(b.dataset.mode);
+        let t = { k: 1, x: 0, y: 0 },
+          size = { w: 0, h: 0 },
+          fitted = false,
+          data = null,
+          tree = null,
+          seen = null,
+          openLabel = null,
+          openKey = null;
+        const apply = () =>
+          view.setAttribute(
+            "transform",
+            `translate(${t.x},${t.y}) scale(${t.k})`,
+          );
+        const fit = () => {
+          const r = graph.getBoundingClientRect(),
+            pad = 40,
+            top = 90,
+            right =
+              $("#report").hidden || $("#report").classList.contains("closed")
+                ? 0
+                : 340;
+          const k = Math.min(
+            (r.width - right - 2 * pad) / size.w,
+            (r.height - top - pad - 70) / size.h,
+            1.2,
+          );
+          t = {
+            k,
+            x: (r.width - right - size.w * k) / 2,
+            y: top + Math.max(0, (r.height - top - 70 - size.h * k) / 2),
+          };
+          apply();
+        };
+        const zoom = (f, cx, cy) => {
+          const k = Math.min(4, Math.max(0.15, t.k * f));
+          t = {
+            k,
+            x: cx - (cx - t.x) * (k / t.k),
+            y: cy - (cy - t.y) * (k / t.k),
+          };
+          apply();
+        };
+        const evButton = document.createElement("button");
+        evButton.title = "Show or hide evidence in the graph (E)";
+        evButton.textContent = "Evidence";
+        $(".tools").prepend(evButton);
+        const showEv = () => evButton.classList.toggle("on", showEvidence);
+        showEv();
+        const toggleEvidence = () => {
+          showEvidence = !showEvidence;
+          const u = new URL(location.href);
+          if (showEvidence) u.searchParams.set("evidence", "on");
+          else u.searchParams.delete("evidence");
+          history.replaceState(null, "", u);
+          showEv();
+          if (!flatMode()) {
+            fitted = false;
+            draw();
+          }
+        };
+        evButton.onclick = toggleEvidence;
+        $("#fit").onclick = fit;
+        $("#zin").onclick = () => {
+          const r = graph.getBoundingClientRect();
+          zoom(1.25, r.width / 2, r.height / 2);
+        };
+        $("#zout").onclick = () => {
+          const r = graph.getBoundingClientRect();
+          zoom(0.8, r.width / 2, r.height / 2);
+        };
+        graph.addEventListener(
+          "wheel",
+          (e) => {
+            e.preventDefault();
+            const r = graph.getBoundingClientRect();
+            zoom(
+              Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)),
+              e.clientX - r.left,
+              e.clientY - r.top,
+            );
+          },
+          { passive: false },
+        );
+        let drag = null;
+        graph.addEventListener("pointerdown", (e) => {
+          if (e.button !== 0) return;
+          drag = {
+            x: e.clientX,
+            y: e.clientY,
+            tx: t.x,
+            ty: t.y,
+            moved: false,
+            node: e.target.closest(".node"),
+          };
+          graph.setPointerCapture(e.pointerId);
+        });
+        graph.addEventListener("pointermove", (e) => {
+          if (!drag) return;
+          const dx = e.clientX - drag.x,
+            dy = e.clientY - drag.y;
+          if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+          drag.moved = true;
+          graph.classList.add("dragging");
+          t.x = drag.tx + dx;
+          t.y = drag.ty + dy;
+          apply();
+        });
+        graph.addEventListener("pointerup", () => {
+          if (drag && !drag.moved && drag.node) open(drag.node.dataset.label);
+          drag = null;
+          graph.classList.remove("dragging");
+        });
+        addEventListener("resize", () => fitted && fit());
+        addEventListener("keydown", (e) => {
+          if (!$("#overlay").hidden || e.target.closest("input,textarea"))
+            return;
+          if (e.key === "l" || e.key === "L")
+            setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
+          if (flatMode()) return;
+          if (e.key === "e" || e.key === "E") toggleEvidence();
+          if (e.key === "f" || e.key === "F") fit();
+          const r = graph.getBoundingClientRect();
+          if (e.key === "+" || e.key === "=")
+            zoom(1.25, r.width / 2, r.height / 2);
+          if (e.key === "-") zoom(0.8, r.width / 2, r.height / 2);
+        });
+
+        const draw = async () => {
+          try {
+            data = await getJSON(`/api/a/${encodeURIComponent(id)}`);
+          } catch (err) {
+            $("#title").innerHTML = `<h1>No analysis ${esc(id)}</h1>`;
+            return;
+          }
+          const a = data;
+          crumbs([
+            ...(a.session
+              ? [[sessionName(a.session, a.sessionInfo), `/s/${a.session}`]]
+              : []),
+            [a.id],
+          ]);
+          tree = build(a);
+          $("#title").innerHTML = `<h1>${esc(a.symptom)}${
+            tree.roots.length > 1
+              ? ` <a class="more" href="#" data-step="S2" title="${esc(
+                  tree.roots
+                    .slice(1)
+                    .map((r) => `${r.name} ${r.text}`)
+                    .join("\n"),
+                )}">and ${tree.roots.length - 1} more</a>`
+              : ""
+          }</h1><div class="sub">${statusChip(a.status)}<code>${esc(a.id)}</code><span>started ${esc(when(a.started))}</span>${a.closed ? `<span>closed ${esc(when(a.closed))}</span>` : ""}<span>click a step to read it</span></div>`;
+          for (const m of $("#title").querySelectorAll("[data-step]"))
+            m.onclick = (e) => {
+              e.preventDefault();
+              open(m.dataset.step);
+            };
+          const flat = flatMode();
+          for (const [sel, show] of [
+            ["#graph", !flat],
+            ["#title", !flat],
+            [".tools", !flat],
+            ["#legend", !flat],
+            ["#flat", flat],
+          ])
+            $(sel).hidden = !show;
+          if (flat) {
+            $("#report").hidden = true;
+            const box = $("#flat"),
+              scroll = box.scrollTop;
+            box.innerHTML = `<div class="page"><div class="ftitle">${$("#title").innerHTML}</div>${mode === "outline" ? outlineHTML(a) : matrixHTML()}</div>`;
+            box.scrollTop = scroll;
+            wireFlat(box);
+            seen = new Set(
+              [...tree.byLabel.values(), ...tree.evidence].map((n) => n.key),
+            );
+            if (location.hash.length > 1 && openLabel === null)
+              openLabel = decodeURIComponent(location.hash.slice(1));
+            if (openLabel !== null) {
+              const again =
+                [...tree.byLabel.values()].find((n) => n.key === openKey) ??
+                tree.find(openLabel);
+              if (again) open(again.label, true);
+              else close();
+            }
+            return;
+          }
+          if (!showEvidence)
+            for (const n of tree.byLabel.values()) n.hang = undefined;
+          const dag = mode === "dag" ? dagLayout(tree, showEvidence) : null;
+          size = dag ?? layout(tree.roots);
+          const nodes = [...tree.byLabel.values()];
+          const causes = nodes.filter((n) => n.kind !== "symptom");
+          const times = causes
+            .map((n) => Date.parse(n.c.added))
+            .filter((x) => !isNaN(x));
+          const lo = Math.min(...times),
+            hi = Math.max(...times);
+          const age = ageRank(causes);
+          const surface = dark() ? [29, 32, 37] : [255, 255, 255];
+          view.replaceChildren();
+          const edges = el("g", {}, view),
+            sames = el("g", {}, view),
+            badges = el("g", {}, view),
+            boxes = el("g", {}, view);
+
+          const badge = (n, jy) => {
+            const live = n.group.causes.filter(counted).length;
+            if (live > 1 || n.group.combine === "parts") {
+              const g = el("g", { class: "badge" }, badges);
+              el("title", {}, g).textContent =
+                COMBINE[n.group.combine] +
+                (n.group.coverage ? `: ${n.group.coverage}` : "");
+              const label = BADGE[n.group.combine],
+                w = label.length * 7.5 + 14;
+              el(
+                "rect",
+                { x: n.x - w / 2, y: jy - 9, width: w, height: 18, rx: 9 },
+                g,
+              );
+              el(
+                "text",
+                { x: n.x, y: jy + 3.5, "text-anchor": "middle" },
+                g,
+              ).textContent = label;
+            }
+          };
+          if (dag)
+            for (const n of dag.nodes) {
+              if (!n.outs.length) continue;
+              // Every edge to a cause, a shared one too, leaves from the junction under
+              // the node, where the badge says how they combine. An edge to cited
+              // evidence leaves from the node's bottom right, dotted.
+              const jy = n.y + n.h + DAG.junction;
+              if (n.outs.some((e) => !e.cite))
+                el(
+                  "path",
+                  { d: `M${n.x},${n.y + n.h} V${jy}`, class: "edge" },
+                  edges,
+                );
+              for (const e of n.outs) {
+                const sx = e.cite ? n.x + n.w / 2 - 24 : n.x,
+                  sy = e.cite ? n.y + n.h : jy;
+                let d = `M${sx},${sy}`,
+                  px = sx,
+                  py = sy;
+                const curve = (qx, qy) => {
+                  const my = (py + qy) / 2;
+                  d += ` C${px},${my} ${qx},${my} ${qx},${qy}`;
+                  px = qx;
+                  py = qy;
+                };
+                if (e.back) {
+                  const low = Math.max(jy, e.to.y + e.to.h) + 60;
+                  d += ` C${px},${low} ${e.to.x},${low} ${e.to.x},${e.to.y + e.to.h}`;
+                  el(
+                    "path",
+                    { d, class: "same-edge", "marker-end": "url(#arrow)" },
+                    sames,
+                  );
+                  continue;
+                }
+                for (const p of e.pts.slice(1)) {
+                  if (p.dummy) {
+                    const y0 = dag.top(p.rank);
+                    curve(p.x, y0);
+                    d += ` V${y0 + DAG.row}`;
+                    py = y0 + DAG.row;
+                  } else curve(e.entry, p.y);
+                }
+                const path = el(
+                  "path",
+                  { d, class: e.cite ? "cite-edge" : "edge" },
+                  e.cite ? sames : edges,
+                );
+                if (e.cite)
+                  el("title", {}, path).textContent =
+                    `${n.label} cites ${e.to.label}`;
+                else if (e.via.hidden)
+                  el("title", {}, path).textContent =
+                    `${e.via.label}: the same cause as step ${e.to.label}`;
+              }
+              if (n.group) badge(n, jy);
+            }
+          else
+            for (const n of nodes) {
+              if (!n.children.length) continue;
+              const bottom = n.y + n.h,
+                jy = bottom + GAP_Y / 2 - 4;
+              const xs = n.children.map((c) => c.x);
+              let d = `M${n.x},${bottom} V${jy} M${Math.min(...xs, n.x)},${jy} H${Math.max(...xs, n.x)}`;
+              for (const c of n.children) d += ` M${c.x},${jy} V${c.y}`;
+              el("path", { d, class: "edge" }, edges);
+              badge(n, jy);
+            }
+          // Tree layout: a dotted link from each cause to the evidence it cites,
+          // into the top of an item below it, else in an arc into its bottom.
+          if (!dag && showEvidence)
+            for (const ev of tree.evidence)
+              for (const n of ev.citers) {
+                const sx = n.x + n.w / 2 - 24,
+                  sy = n.y + n.h,
+                  tx = ev.x;
+                const d =
+                  ev.y > sy
+                    ? `M${sx},${sy} C${sx},${sy + 40} ${tx},${ev.y - 40} ${tx},${ev.y}`
+                    : ((low) =>
+                        `M${sx},${sy} C${sx},${low} ${tx},${low} ${tx},${ev.y + ev.h}`)(
+                        Math.max(sy, ev.y + ev.h) + 50,
+                      );
+                const path = el("path", { d, class: "cite-edge" }, sames);
+                el("title", {}, path).textContent =
+                  `${n.label} cites ${ev.label}`;
+              }
+
+          for (const n of nodes) {
+            if (n.hidden && dag) continue;
+            const g = el(
+              "g",
+              {
+                class: "node",
+                "data-label": n.label,
+                transform: `translate(${n.x - n.w / 2},${n.y})`,
+              },
+              boxes,
+            );
+            if (n.kind === "same") {
+              g.setAttribute("class", "node pill");
+              el("rect", { width: n.w, height: n.h, rx: n.h / 2 }, g);
+              el(
+                "text",
+                { x: n.w / 2, y: n.h / 2 + 4, "text-anchor": "middle" },
+                g,
+              ).textContent = `${n.label} = ${n.c.same}`;
+              // To a step below, into its top; to any other, in an arc under both
+              // rows and up into its bottom, so that it crosses no box of its row.
+              const target = tree.byLabel.get(n.c.same);
+              if (target) {
+                const sx = n.x,
+                  sy = n.y + n.h,
+                  tx = target.x;
+                const d =
+                  target.y > sy
+                    ? `M${sx},${sy} C${sx},${sy + 50} ${tx},${target.y - 50} ${tx},${target.y}`
+                    : ((low) =>
+                        `M${sx},${sy} C${sx},${low} ${tx},${low} ${tx},${target.y + target.h}`)(
+                        Math.max(sy, target.y + target.h) + 70,
+                      );
+                el(
+                  "path",
+                  { d, class: "same-edge", "marker-end": "url(#arrow)" },
+                  sames,
+                );
+              }
+              continue;
+            }
+            const c = n.c;
+            const color =
+              n.kind === "symptom"
+                ? hex(dark() ? "#9aa0a9" : "#646a73")
+                : viridis(age(n));
+            const fixLike =
+              c &&
+              c.status !== "refuted" &&
+              (c.reach === "fix" ||
+                (c.reach === "design" && c.verdict === "change"));
+            g.setAttribute(
+              "class",
+              `node ${n.kind} ${c ? c.status : ""} ${fixLike ? "fixed" : ""} ${seen && !seen.has(n.key) ? "fresh" : ""}`,
+            );
+            el(
+              "rect",
+              {
+                class: "halo",
+                x: -2,
+                y: -2,
+                width: n.w + 4,
+                height: n.h + 4,
+                rx: 10,
+              },
+              g,
+            );
+            el(
+              "rect",
+              {
+                class: "box",
+                width: n.w,
+                height: n.h,
+                rx: 8,
+                fill: rgb(
+                  mix(
+                    surface,
+                    color,
+                    n.kind === "symptom" ? 0.06 : dark() ? 0.3 : 0.2,
+                  ),
+                ),
+                stroke: rgb(color),
+              },
+              g,
+            );
+            if (n.kind !== "symptom")
+              el(
+                "rect",
+                { x: 0, y: 0, width: 7, height: n.h, rx: 3, fill: rgb(color) },
+                g,
+              );
+            const fo = el(
+              "foreignObject",
+              {
+                x: n.kind === "symptom" ? 12 : 15,
+                y: 7,
+                width: n.w - (n.kind === "symptom" ? 24 : 24),
+                height: n.h - 12,
+              },
+              g,
+            );
+            fo.innerHTML =
+              n.kind === "symptom"
+                ? `<div xmlns="http://www.w3.org/1999/xhtml" class="nbox symptom"><div class="kicker">Symptom${n.name ? ` ${n.name}` : ""}</div><div class="ntext">${esc(n.text)}</div></div>`
+                : `<div xmlns="http://www.w3.org/1999/xhtml" class="nbox"><div class="nhead"><span class="step">${esc(n.label)}</span>${chips(c)}</div><div class="ntext">${inline(c.cause)}</div></div>`;
+            el("title", {}, g).textContent =
+              n.kind === "symptom" ? n.text : `${n.label} ${c.cause}`;
+          }
+
+          for (const n of tree.evidence) {
+            if (
+              dag
+                ? !dag.nodes.includes(n)
+                : !showEvidence || n.x === undefined || !n.host
+            )
+              continue;
+            const g = el(
+              "g",
+              {
+                class: `node evidence ${seen && !seen.has(n.key) ? "fresh" : ""}`,
+                "data-label": n.label,
+                transform: `translate(${n.x - n.w / 2},${n.y})`,
+              },
+              boxes,
+            );
+            const w = n.w,
+              h = n.h,
+              k = 10;
+            el(
+              "rect",
+              {
+                class: "halo",
+                x: -2,
+                y: -2,
+                width: w + 4,
+                height: h + 4,
+                rx: 8,
+              },
+              g,
+            );
+            el(
+              "polygon",
+              {
+                class: "tag",
+                points: `${k},0 ${w - k},0 ${w},${h / 2} ${w - k},${h} ${k},${h} 0,${h / 2}`,
+                fill: rgb(
+                  mix(
+                    surface,
+                    hex(dark() ? "#7bd88f" : "#1f7a3d"),
+                    dark() ? 0.18 : 0.1,
+                  ),
+                ),
+              },
+              g,
+            );
+            const fo = el(
+              "foreignObject",
+              { x: k, y: 4, width: w - 2 * k, height: h - 8 },
+              g,
+            );
+            fo.innerHTML = `<div xmlns="http://www.w3.org/1999/xhtml" class="nbox ev"><span class="step">${esc(n.label)}</span><div class="ntext">${esc(n.e.text)}</div></div>`;
+            el("title", {}, g).textContent = `${n.label} ${n.e.text}`;
+          }
+
+          $("#legend").innerHTML = times.length
+            ? `Order in which the steps were added<div class="ramp" style="background:linear-gradient(90deg,${VIRIDIS.join(",")})"></div><div class="ends"><span>${esc(when(new Date(lo).toISOString()))} (oldest)</span><span>${esc(when(new Date(hi).toISOString()))} (newest)</span></div>` +
+              `<div class="keys"><span><svg width="26" height="12"><rect x="1" y="1" width="24" height="10" rx="3" fill="none" stroke="currentColor" stroke-dasharray="4 3"/></svg> hypothesis</span><span><svg width="26" height="12"><rect x="1.5" y="1.5" width="23" height="9" rx="3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray=".5 3.5"/></svg> supported, not proven</span>${tree.evidence.length ? '<span><svg width="26" height="12"><polygon points="5,1 21,1 25,6 21,11 5,11 1,6" fill="none" stroke="var(--good)" stroke-width="1.3"/></svg> evidence, <svg width="22" height="12"><path d="M1,6 H21" stroke="var(--good)" stroke-width="1.5" stroke-dasharray="2 3"/></svg> cited by</span>' : ""}${dag ? "<span>several edges in: a shared step</span>" : '<span><svg width="26" height="12"><path d="M1,6 C9,0 17,12 25,6" fill="none" stroke="var(--accent)" stroke-dasharray="4 3"/></svg> same step</span>'}<span style="opacity:.5;text-decoration:line-through">ruled out</span></div>`
+            : "No causes yet.";
+          report(a);
+          if (!fitted) {
+            fit();
+            fitted = true;
+            if (location.hash.length > 1)
+              openLabel = decodeURIComponent(location.hash.slice(1));
+          }
+          seen = new Set([...nodes, ...tree.evidence].map((n) => n.key));
+          if (openLabel !== null) {
+            const again =
+              nodes.find((n) => n.key === openKey) ?? tree.find(openLabel);
+            if (again) open(again.label, true);
+            else close();
+          }
+        };
+
+        // Outline: every step as a row of an indented list, in step order, with its
+        // full cause text, its chips and its evidence as tags; a step's causes nest
+        // under it and fold with a click on the caret. Evidence follows as a list.
+        const folded = new Set();
+        const swatch = (n, age) =>
+          n.kind === "cause"
+            ? `<span class="swatch" style="background:${rgb(viridis(age(n)))}"></span>`
+            : "";
+        const evTags = (n) =>
+          (n.cites ?? [])
+            .map(
+              (e) =>
+                `<span class="evchip" data-step="${esc(e.label)}" title="${esc(e.e.text)}">${esc(e.label)}</span>`,
+            )
+            .join("");
+        function outlineHTML(a) {
+          const age = ageRank(
+            [...tree.byLabel.values()].filter((m) => m.kind !== "symptom"),
+          );
+          const fresh = (n) => (seen && !seen.has(n.key) ? " fresh-row" : "");
+          const row = (n) => {
+            const kids = n.children;
+            const caret = `<span class="caret${kids.length ? "" : " leaf"}" data-fold="${esc(n.key)}">${folded.has(n.key) ? "▸" : "▾"}</span>`;
+            let body;
+            if (n.kind === "symptom")
+              body = `<span class="text">${inline(n.text)}</span>`;
+            else if (n.kind === "same")
+              body = `<span class="text">The same cause as step <a class="jump" href="#" data-step="${esc(n.c.same)}">${esc(n.c.same)}</a></span>`;
+            else
+              body = `<span class="chips">${chips(n.c)}</span><span class="text">${inline(n.c.cause)}</span>${n.cites.length ? `<span class="cites">${evTags(n)}</span>` : ""}`;
+            const live = n.group ? n.group.causes.filter(counted).length : 0;
+            if (n.group && (live > 1 || n.group.combine === "parts"))
+              body += `<span class="comb">${esc(COMBINE[n.group.combine])}${n.group.coverage ? `: ${inline(n.group.coverage)}` : ""}</span>`;
+            const cls = n.kind === "cause" ? n.c.status : n.kind;
+            const label = n.kind === "symptom" ? n.name || "Symptom" : n.label;
+            return (
+              `<li class="${folded.has(n.key) ? "closed" : ""}"><div class="orow ${esc(cls)}${fresh(n)}" data-step="${esc(n.label)}">${caret}<span class="step">${swatch(n, age)}${esc(label)}</span><span class="body">${body}</span></div>` +
+              (kids.length ? `<ul>${kids.map(row).join("")}</ul>` : "") +
+              "</li>"
+            );
+          };
+          const ev = tree.evidence;
+          return (
+            `<div class="ftools"><button data-all="open">Expand all</button><button data-all="fold">Collapse all</button></div>` +
+            `<ul class="outline">${tree.roots.map(row).join("")}</ul>` +
+            (ev.length
+              ? `<h2>Evidence</h2><ul class="evlist">${ev.map((e) => `<li data-step="${esc(e.label)}" class="${fresh(e).trim()}"><span class="evchip">${esc(e.label)}</span><span>${inline(e.e.text)}${e.citers.length ? `<span class="by"> · cited by ${e.citers.map((m) => esc(m.label)).join(", ")}</span>` : '<span class="by"> · not cited</span>'}</span></li>`).join("")}</ul>`
+              : "")
+          );
+        }
+        // Matrix: a row per step in step order, a column per evidence item in the
+        // order the steps first cite them, a dot where a step cites the item.
+        function matrixHTML() {
+          const rows = [...tree.byLabel.values()].filter(
+            (n) => n.kind === "cause",
+          );
+          const cols = [];
+          for (const n of rows)
+            for (const e of n.cites) if (!cols.includes(e)) cols.push(e);
+          for (const e of tree.evidence) if (!cols.includes(e)) cols.push(e);
+          if (!rows.length) return '<p class="empty">No causes yet.</p>';
+          const depth = (n) => n.label.split(".").length - 1;
+          return (
+            `<table class="matrix"><thead><tr><th class="row"></th>${cols.map((e, j) => `<th class="ev" data-col="${j}" data-step="${esc(e.label)}" title="${esc(e.label)} ${esc(e.e.text)}"><span>${esc(e.label)}</span></th>`).join("")}</tr></thead><tbody>` +
+            rows
+              .map(
+                (n) =>
+                  `<tr class="${esc(n.c.status)}"><th class="row" data-step="${esc(n.label)}" title="${esc(n.label)} ${esc(n.c.cause)}"><div style="padding-left:${depth(n) * 14}px"><span class="step">${esc(n.label)}</span>${esc(n.c.cause)}</div></th>${cols.map((e, j) => `<td data-col="${j}" class="${n.cites.includes(e) ? "on" : ""}"${n.cites.includes(e) ? ` data-step="${esc(e.label)}" title="${esc(n.label)} cites ${esc(e.label)}"` : ""}></td>`).join("")}</tr>`,
+              )
+              .join("") +
+            `</tbody><tfoot><tr><th>cited by</th>${cols.map((e) => `<td>${e.citers.length}</td>`).join("")}</tr></tfoot></table>`
+          );
+        }
+        function wireFlat(box) {
+          box.onclick = (e) => {
+            const f = e.target.closest("[data-fold]");
+            if (f) {
+              const li = f.closest("li");
+              li.classList.toggle("closed");
+              f.textContent = li.classList.contains("closed") ? "▸" : "▾";
+              if (li.classList.contains("closed")) folded.add(f.dataset.fold);
+              else folded.delete(f.dataset.fold);
+              return;
+            }
+            const all = e.target.closest("[data-all]");
+            if (all) {
+              for (const c of box.querySelectorAll("[data-fold]")) {
+                const li = c.closest("li"),
+                  shut =
+                    all.dataset.all === "fold" && !c.classList.contains("leaf");
+                li.classList.toggle("closed", shut);
+                c.textContent = shut ? "▸" : "▾";
+                if (shut) folded.add(c.dataset.fold);
+                else folded.delete(c.dataset.fold);
+              }
+              return;
+            }
+            const s = e.target.closest("[data-step]");
+            if (s && !e.target.closest("a:not(.jump)")) {
+              e.preventDefault();
+              open(s.dataset.step);
+            }
+          };
+          // Matrix: the hovered column lights up, as the row does by CSS.
+          box.onmouseover = (e) => {
+            const c = e.target.closest("[data-col]");
+            for (const h of box.querySelectorAll(".hot"))
+              h.classList.remove("hot");
+            if (c)
+              for (const h of box.querySelectorAll(
+                `[data-col="${c.dataset.col}"]`,
+              ))
+                h.classList.add("hot");
+          };
+        }
+        // The supported causes on a step's path from its symptom, itself included:
+        // the unproven links that a cause, and a fix there, rest on.
+        const unproven = (n) => {
+          const out = [];
+          for (let m = n; m && m.kind === "cause"; m = m.parent)
+            if (m.c.status === "supported") out.unshift(m.label);
+          return out;
+        };
+        const linksText = (links) =>
+          `${links.length} unproven link${links.length === 1 ? "" : "s"}: ${links.join(", ")}`;
+        const isFix = (c) =>
+          c.status !== "refuted" &&
+          (c.reach === "fix" ||
+            (c.reach === "design" && c.verdict === "change"));
+        function fixesPanel(step) {
+          const fixes = [...tree.byLabel.values()].filter(
+            (n) => n.kind === "cause" && isFix(n.c),
+          );
+          return fixes.length
+            ? `<h3>Fixes</h3><ul>${fixes
+                .map((n) => {
+                  const links = unproven(n);
+                  return `<li>${step(n.label)} ${inline(n.c.cause)}${links.length ? `<br><span class="chip unproven">rests on ${esc(linksText(links))}</span>` : ""}</li>`;
+                })
+                .join("")}</ul>`
+            : "";
+        }
+
+        function report(a) {
+          const box = $("#report");
+          const step = (s) =>
+            `<span class="steplink" data-step="${esc(s)}">${esc(s)}</span>`;
+          if (a.status === "concluded") {
+            box.hidden = false;
+            box.innerHTML =
+              `<h2>Conclusion <span>▾</span></h2>` +
+              fixesPanel(step) +
+              (tree.roots.length > 1
+                ? `<h3>Symptoms</h3><ul>${tree.roots.map((r) => `<li>${step(r.label)} ${inline(r.text)}</li>`).join("")}</ul>`
+                : "") +
+              `<h3>Left alone</h3>${(a.leftAlone ?? []).length ? `<ul>${a.leftAlone.map((u) => `<li>${step(u.step)} ${inline(u.reason)}</li>`).join("")}</ul>` : '<p class="note">Nothing: every branch end was fixed.</p>'}` +
+              `<h3>How it could have been avoided</h3>${(a.avoidable ?? []).length ? `<ul>${a.avoidable.map((v) => `<li>${inline(v.avoidable)}<br><b>Change:</b> ${inline(v.avoid)}<br><span class="chip ${v.worth === "yes" ? "checked" : ""}">worth it: ${esc(v.worth)}</span> ${inline(v.why)}</li>`).join("")}</ul>` : '<p class="note">Nothing found.</p>'}`;
+          } else if (a.status === "abandoned") {
+            box.hidden = false;
+            box.innerHTML = `<h2>Abandoned <span>▾</span></h2>${prose(a.reason)}`;
+          } else box.hidden = true;
+          $("h2", box)?.addEventListener("click", () =>
+            box.classList.toggle("closed"),
+          );
+          for (const s of box.querySelectorAll(".steplink"))
+            s.onclick = () => open(s.dataset.step);
+        }
+
+        function open(label, refresh = false) {
+          const n = tree.find(label);
+          if (!n) return;
+          openLabel = label;
+          openKey = n.key;
+          history.replaceState(null, "", `#${label}`);
+          const doc = $("#doc"),
+            overlay = $("#overlay"),
+            scroll = overlay.scrollTop;
+          doc.innerHTML =
+            n.kind === "symptom"
+              ? symptomDoc(data, n)
+              : n.kind === "same"
+                ? sameDoc(n)
+                : n.kind === "evidence"
+                  ? evidenceDoc(n)
+                  : causeDoc(data, n);
+          overlay.hidden = false;
+          overlay.scrollTop = refresh ? scroll : 0;
+          $(".close", doc).onclick = close;
+          for (const j of doc.querySelectorAll("a.jump"))
+            j.onclick = (e) => {
+              e.preventDefault();
+              open(j.dataset.step);
+            };
+        }
+        function close() {
+          $("#overlay").hidden = true;
+          openLabel = openKey = null;
+          history.replaceState(null, "", location.pathname + location.search);
+        }
+        $("#overlay").addEventListener("click", (e) => {
+          if (e.target.id === "overlay") close();
+        });
+        addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && !$("#overlay").hidden) close();
+        });
+
+        const jump = (label, text) =>
+          `<a class="jump" href="#" data-step="${esc(label)}">${esc(label)}</a>${text ? ` ${inline(text)}` : ""}`;
+        const section = (title, body) =>
+          body ? `<section><h3>${title}</h3>${body}</section>` : "";
+        const childrenOf = (n) => {
+          if (!n.group) return "";
+          const list = n.children
+            .map(
+              (c) =>
+                `<li>${jump(c.label, c.kind === "same" ? `the same cause as step ${c.c.same}` : c.c.cause)}${c.kind !== "same" && c.c.status === "refuted" ? ' <span class="chip refuted">ruled out</span>' : ""}</li>`,
+            )
+            .join("");
+          const live = n.group.causes.filter(counted).length;
+          return `<p>${live > 1 || n.group.combine === "parts" ? `<b>${COMBINE[n.group.combine]}.</b>` : "One cause."}${n.group.coverage ? ` ${inline(n.group.coverage)}` : ""}</p><ul>${list}</ul>`;
+        };
+        const under = (p) =>
+          p.kind === "symptom"
+            ? p.name
+              ? `symptom ${p.name}`
+              : "the symptom"
+            : `step ${p.label}`;
+        const rootOf = (n) => {
+          while (n.parent) n = n.parent;
+          return n;
+        };
+        const closeBtn =
+          '<button class="close" title="Close (Esc)" aria-label="Close">×</button>';
+
+        function causeDoc(a, n) {
+          const c = n.c;
+          const named = [...tree.byLabel.values()].filter(
+            (m) => m.kind === "same" && m.c.same === n.label,
+          );
+          const left = (a.leftAlone ?? []).find((u) => u.step === n.label);
+          const color = viridis(
+            ageRank(
+              [...tree.byLabel.values()].filter((m) => m.kind !== "symptom"),
+            )(n),
+          );
+          const links = unproven(n);
+          const effects =
+            c.effects === undefined
+              ? ""
+              : c.effects.length
+                ? `<ul>${c.effects.map((e) => `<li>${inline(e)}</li>`).join("")}</ul>`
+                : "<p>None found.</p>";
+          return (
+            closeBtn +
+            `<div class="kick"><span class="swatch" style="background:${rgb(color)}"></span><span class="step">Step ${esc(n.label)}</span><span class="chip ${esc(c.status)}">${esc(c.status === "refuted" ? "ruled out" : c.status)}</span>${c.reach ? `<span class="chip">${esc(c.reach)}</span>` : ""}</div>` +
+            `<h2 class="${c.status === "refuted" ? "struck" : ""}">${inline(c.cause)}</h2>` +
+            section(
+              "Evidence",
+              prose(c.evidence) +
+                ((n.cites ?? []).length
+                  ? `<ul>${n.cites
+                      .map(
+                        (e) =>
+                          `<li>${jump(e.label, e.e.text)}${
+                            e.citers.length > 1
+                              ? ` <span class="note">(also cited by ${e.citers
+                                  .filter((m) => m !== n)
+                                  .map((m) => esc(m.label))
+                                  .join(", ")})</span>`
+                              : ""
+                          }</li>`,
+                      )
+                      .join("")}</ul>`
+                  : ""),
+            ) +
+            section("Status", `<p>${STATUS[c.status] ?? esc(c.status)}</p>`) +
+            section("The check that would prove it", prose(c.proof)) +
+            section("Why that check cannot be run", prose(c.unprovable)) +
+            section(
+              isFix(c)
+                ? "This fix rests on unproven links"
+                : "Unproven links on its path",
+              links.length && c.status !== "refuted"
+                ? `<p>${links.length} unproven link${links.length === 1 ? "" : "s"}: ${links.map((l) => jump(l)).join(", ")}</p>`
+                : "",
+            ) +
+            section("What else it affects", effects) +
+            section(
+              "Reach",
+              c.reach ? `<p>${esc(REACH[c.reach] ?? c.reach)}</p>` : "",
+            ) +
+            section("Purpose of the design", prose(c.purpose)) +
+            section(
+              "Verdict on the design",
+              c.verdict
+                ? `<p>${c.verdict === "keep" ? "Keep it." : "Change it."}</p>`
+                : "",
+            ) +
+            section("Why it is kept", prose(c.keepReason)) +
+            section("The change", prose(c.change)) +
+            section(
+              "The fix",
+              c.fix ? `<p>${esc(FIX[c.fix] ?? c.fix)}</p>` : "",
+            ) +
+            section("Why the fix is in proportion", prose(c.proportion)) +
+            section("Why it only hides the cause", prose(c.hideReason)) +
+            (c.weight || c.share || c.need
+              ? `<div class="two">${section("Weight", prose(c.weight))}${section("Share of the whole", prose(c.share))}${section("What it would be if right", prose(c.need))}</div>`
+              : "") +
+            section("Its causes", childrenOf(n)) +
+            section(
+              "Also named by",
+              named.length
+                ? `<ul>${named.map((m) => `<li>${jump(m.label, `under ${under(m.parent)}`)}</li>`).join("")}</ul>`
+                : "",
+            ) +
+            section("Left alone", left ? prose(left.reason) : "") +
+            `<div class="times">Added ${esc(when(c.added))} (${esc(ago(c.added))})${c.revised && c.revised !== c.added ? ` · last revised ${esc(when(c.revised))} (${esc(ago(c.revised))})` : ""}${c.estimated ? ' · <span class="note">times estimated from the log; this record has no recorded times</span>' : ""}</div>`
+          );
+        }
+
+        function evidenceDoc(n) {
+          return (
+            closeBtn +
+            `<div class="kick"><span class="step">Evidence ${esc(n.label)}</span></div>` +
+            section("What it shows", prose(n.e.text)) +
+            section(
+              "Cited by",
+              n.citers.length
+                ? `<ul>${n.citers.map((m) => `<li>${jump(m.label, m.c.cause)} <span class="chip ${esc(m.c.status)}">${esc(m.c.status)}</span></li>`).join("")}</ul>`
+                : '<p class="note">No cause cites it.</p>',
+            ) +
+            (n.e.added
+              ? `<div class="times">Added ${esc(when(n.e.added))} (${esc(ago(n.e.added))})</div>`
+              : "")
+          );
+        }
+
+        function sameDoc(n) {
+          const target = tree.byLabel.get(n.c.same);
+          return (
+            closeBtn +
+            `<div class="kick"><span class="step">Step ${esc(n.label)}</span></div><h2>The same cause as step ${jump(n.c.same)}</h2>` +
+            section(
+              "That step",
+              target && target.c ? `<p>${inline(target.c.cause)}</p>` : "",
+            ) +
+            section(
+              "Named under",
+              `<p>${n.parent.kind === "symptom" ? jump(n.parent.label, under(n.parent)) : jump(n.parent.label, n.parent.c.cause)}</p>`,
+            ) +
+            `<p class="note">It is not walked again here, and counts as step ${esc(n.c.same)} when the fixes are checked against ${under(n.parent.kind === "symptom" ? n.parent : rootOf(n))}.</p>` +
+            `<div class="times">Added ${esc(when(n.c.added))} (${esc(ago(n.c.added))})</div>`
+          );
+        }
+
+        // With several symptoms, each one's document lists the others, and the
+        // branch ends left alone under it; how it could have been avoided is shared.
+        function symptomDoc(a, n) {
+          const others = tree.roots.filter((r) => r !== n);
+          const mine = (a.leftAlone ?? []).filter(
+            (u) =>
+              !n.name ||
+              (n === tree.roots[0]
+                ? !/^S/.test(u.step)
+                : u.step.startsWith(`${n.name}.`)),
+          );
+          return (
+            closeBtn +
+            `<div class="kick"><span class="step">Symptom${n.name ? ` ${esc(n.name)}` : ""}</span>${statusChip(a.status)}</div><h2>${inline(n.text)}</h2>` +
+            section(
+              "Why",
+              n.group
+                ? childrenOf(n)
+                : '<p class="note">No causes recorded yet.</p>',
+            ) +
+            section(
+              "Left alone",
+              mine.length
+                ? `<ul>${mine.map((u) => `<li>${jump(u.step, u.reason)}</li>`).join("")}</ul>`
+                : "",
+            ) +
+            section(
+              "The other symptoms",
+              others.length
+                ? `<ul>${others.map((r) => `<li>${jump(r.label, r.text)}</li>`).join("")}</ul>`
+                : "",
+            ) +
+            section(
+              "How it could have been avoided",
+              (a.avoidable ?? []).length
+                ? `<ul>${a.avoidable.map((v) => `<li>${inline(v.avoidable)} <b>Change:</b> ${inline(v.avoid)} <b>Worth it:</b> ${esc(v.worth)}. ${inline(v.why)}</li>`).join("")}</ul>`
+                : "",
+            ) +
+            section("Why it was abandoned", prose(a.reason)) +
+            `<div class="times">Analysis <code>${esc(a.id)}</code> · started ${esc(when(a.started))}${a.closed ? ` · closed ${esc(when(a.closed))}` : ""}${a.session ? ` · session <code>${esc(a.session)}</code>` : ""}</div>`
+          );
+        }
+
+        await draw();
+        listeners.push((changed) => {
+          if (changed.includes(`${id}.json`)) draw();
+        });
+        matchMedia("(prefers-color-scheme: dark)").addEventListener(
+          "change",
+          draw,
+        );
+      }
+
+      // ---------- routing ----------
+
+      const parts = location.pathname
+        .split("/")
+        .filter(Boolean)
+        .map(decodeURIComponent);
+      connect();
+      if (parts[0] === "s" && parts[1]) sessionView(parts[1]);
+      else if (parts[0] === "a" && parts[1]) analysisView(parts[1]);
+      else sessionsView();
+    </script>
+  </body>
+</html>

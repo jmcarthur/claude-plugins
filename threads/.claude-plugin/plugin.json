@@ -1,0 +1,19 @@
+{
+  "name": "threads",
+  "version": "0.42.4",
+  "description": "Keeps a session's lines of thought as threads, each with its history and the questions waiting on you, in a pane beside the chat.",
+  "author": {
+    "name": "jmcarthur"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/jmcarthur/claude-plugins",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "band": {
+      "type": "boolean",
+      "title": "Band above the prompt",
+      "description": "Show the band above the prompt with waiting questions and unread threads.",
+      "default": true
+    }
+  }
+}
