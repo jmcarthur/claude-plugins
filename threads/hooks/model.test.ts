@@ -105,8 +105,17 @@ test("a reply's tag lines file each section under its threads; an untagged promp
     "Overall: on track.",
   ]);
   expect(stopProblems(b)).toBeUndefined();
+  // The note names its message by its opening words, since one user message can hold several.
   expect(promptContext(b, "How should errors look?")).toContain(
-    "filed under [[main]] alone",
+    'The message that begins "How should errors look?" has no tag, so it is filed under [[main]] alone.',
+  );
+  expect(
+    promptContext(
+      b,
+      "How should errors look when the parser\n  meets a stray brace?",
+    ),
+  ).toContain(
+    'The message that begins "How should errors look when the parser…" has no tag',
   );
   // Claude may file it under the thread it was about, marked as the main session's.
   const out = fileUntagged(b, ["parser"], 4, true);
@@ -184,6 +193,85 @@ test("text before any tag line is untagged, the stop asks to file it, and filing
   ]);
   expect((historyOf(out.book, "parser").at(-1)! as Message).uuid).toBe("r1");
   expect(stopProblems(out.book)).toBeUndefined();
+});
+
+// Two untagged blocks of a turn, about different threads.
+const twoBlocks = () => {
+  let b = opened(opened(emptyBook(0), "parser"), "lexer");
+  b = startTurn(b, "go", "u1", 2);
+  b = recordReply(b, "The parser drops a token.", "r1", 3);
+  b = recordReply(b, "The lexer splits on tabs.\nSecond line.", "r2", 4);
+  return b;
+};
+
+test("each untagged block files alone by a quote, and then the stop asks nothing", async () => {
+  const b = twoBlocks();
+  expect(stopProblems(b)).toContain("with quote: its opening words");
+  let out = fileUntagged(b, ["lexer"], 5, false, "the lexer  SPLITS");
+  expect(out.isError).toBeUndefined();
+  expect(out.message).toBe(
+    "Filed under [[lexer]]. 1 more block is still untagged.",
+  );
+  const filed = historyOf(out.book, "lexer").at(-1)! as Message;
+  expect([filed.text, filed.uuid, filed.at]).toEqual([
+    "The lexer splits on tabs.\nSecond line.",
+    "r2",
+    4,
+  ]);
+  expect(out.book.turn.untagged.map((p) => p.text)).toEqual([
+    "The parser drops a token.",
+  ]);
+  expect(stopProblems(out.book)).toContain("- “The parser drops a token.”");
+  out = fileUntagged(out.book, ["parser"], 6, false, "The parser drops");
+  expect(out.message).toBe("Filed under [[parser]].");
+  expect(entryText(historyOf(out.book, "parser").at(-1)!)).toBe(
+    "The parser drops a token.",
+  );
+  expect(stopProblems(out.book)).toBeUndefined();
+});
+
+test("a quote that several untagged blocks hold is refused with the blocks", async () => {
+  const out = fileUntagged(twoBlocks(), ["parser"], 5, false, "the");
+  expect(out.isError).toBe(true);
+  expect(out.message).toContain("2 blocks of this turn's untagged text");
+  expect(out.message).toContain("- The parser drops a token.");
+});
+
+test("each route the stop names for untagged text files it", async () => {
+  // No quote: every block, under the same threads.
+  let out = fileUntagged(twoBlocks(), ["parser"], 5);
+  expect(entryText(historyOf(out.book, "parser").at(-1)!)).toBe(
+    "The parser drops a token.\n\nThe lexer splits on tabs.\nSecond line.",
+  );
+  expect(stopProblems(out.book)).toBeUndefined();
+  // A quote of each listed block's opening words, as the stop quotes them.
+  let b = twoBlocks();
+  for (const line of stopProblems(b)!.matchAll(/^- “(.+)”$/gm)) {
+    out = fileUntagged(b, ["parser"], 5, false, line[1]);
+    expect(out.isError).toBeUndefined();
+    b = out.book;
+  }
+  expect(stopProblems(b)).toBeUndefined();
+  // One block: the stop offers the call with no quote alone.
+  let one = opened(emptyBook(0), "parser");
+  one = recordReply(startTurn(one, "go", "u1", 2), "Some words.", "r1", 3);
+  expect(stopProblems(one)).not.toContain("with quote");
+});
+
+test("a quote that no untagged block holds still finds a filed message", async () => {
+  let b = opened(emptyBook(0), "parser");
+  b = recordReply(
+    startTurn(b, "go", "u1", 2),
+    "[[parser]]\nFiled words.",
+    "r1",
+    3,
+  );
+  b = recordReply(startTurn(b, "next", "u2", 4), "Loose words.", "r2", 5);
+  const out = fileUntagged(b, ["main"], 6, false, "Filed words");
+  expect(out.message).toContain(
+    "Filed that section of your reply under [[main]]",
+  );
+  expect(out.book.turn.untagged.map((p) => p.text)).toEqual(["Loose words."]);
 });
 
 test("untagged text stored as strings reads as pieces, and still files and quotes", async () => {
@@ -335,7 +423,7 @@ test("a prompt that opens with a tag is filed under it; Claude's text goes under
   b = recordReply(b, "Still going.", "r3", 5);
   expect(entryText(historyOf(b, "parser").at(-1)!)).toBe("Still going.");
   expect(promptContext(b, "[[parser]] yes")).toContain(
-    "The user filed this message under [[parser]].",
+    'The user filed the message that begins "[[parser]] yes" under [[parser]].',
   );
 });
 
@@ -613,8 +701,12 @@ test("a prompt that opens with a question's id is filed under its thread and sai
     subs: [],
   });
   const context = promptContext(b, "q1: yes");
-  expect(context).toContain("filed this message under [[plan]]");
-  expect(context).toContain("It answers q1, each on its line");
+  expect(context).toContain(
+    'The user filed the message that begins "q1: yes" under [[plan]].',
+  );
+  expect(context).toContain(
+    'The message that begins "q1: yes" answers q1, each on its line',
+  );
   b = startTurn(b, "q1: yes", "u1", 3);
   expect(entryText(historyOf(b, "plan").at(-1)!)).toBe("q1: yes");
 });

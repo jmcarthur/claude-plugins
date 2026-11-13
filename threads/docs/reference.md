@@ -222,6 +222,11 @@ work belongs to the thread of the reply that started it.
     thread's tag. It shows dim at the foot of the history, marked not seen by
     Claude yet, until it reaches the session: at once when Claude is idle, or
     when the running turn ends.
+  - A message that does not reach the session comes back to the field, or to the
+    prompt box when the field holds something else, and a toast says why.
+    Interrupting a turn discards what the pane queued behind it, so a message
+    sent while Claude was working comes back this way. Answers sent from cards
+    are drafted on their cards again.
 - **Question cards.** A question works like AskUserQuestion, except that it
   waits in its thread instead of stopping the session.
   - Its options show their descriptions. A choice takes one pick, `( )`, and a

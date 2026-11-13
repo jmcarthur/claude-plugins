@@ -1,5 +1,6 @@
 import { atom, derive, read, update } from "claude-code";
 import type {
+  Atom,
   EngineEventOf,
   EngineInterface,
   Register,
@@ -31,6 +32,7 @@ import {
   markRow,
   markSeen,
   markSent,
+  restoreSent,
   optionsOf,
   ordered,
   sortedBy,
@@ -118,6 +120,41 @@ const outbox = atom(
   { shape: "outbox-2" },
 );
 
+// What this module last read or wrote of the book, the drafts and the view. A press that sends the
+// person's words must call $.prompt.submit before it awaits anything (see submit), so it builds the
+// message from these: what the pane drew, and any change already on its way.
+type Tracked = typeof book | typeof drafts | typeof view;
+const seen = new Map<unknown, unknown>();
+const lastOf = <T,>(a: Atom<T>): T | undefined => seen.get(a) as T | undefined;
+function track<T>(
+  $: EngineInterface,
+  a: Atom<T> & Tracked,
+  fn: (value: T) => T,
+): Promise<T> {
+  if (seen.has(a)) seen.set(a, fn(seen.get(a) as T));
+  // Each atom is named at its own call: the engine lists what a module reads and writes from them.
+  const updating = (
+    a === book
+      ? update($, book, fn as never)
+      : a === drafts
+        ? update($, drafts, fn as never)
+        : update($, view, fn as never)
+  ) as Promise<T>;
+  return updating.then((value) => {
+    seen.set(a, value);
+    return value;
+  });
+}
+function look<T>($: EngineInterface, a: Atom<T> & Tracked): Promise<T> {
+  const reading = (
+    a === book ? read($, book) : a === drafts ? read($, drafts) : read($, view)
+  ) as Promise<T>;
+  return reading.then((value) => {
+    seen.set(a, value);
+    return value;
+  });
+}
+
 const TOOL = {
   thread: "mcp__threads__thread",
   ask: "mcp__threads__ask",
@@ -157,7 +194,7 @@ const ASK_DESCRIPTION =
 const SETTLE_DESCRIPTION =
   "Settle a question once the user answered it (answer: the answer as they gave it) or once it no longer needs answering (retract: why). Answer only when the reply answers what the question asked. When the user tables, declines or defers it, or says they cannot or will not answer it, retract it with their words as the reason, and ask again later if it still matters. Settle each question as soon as it is answered or moot, without being asked. To correct a question settled the wrong way, settle it again the other way.";
 const FILE_DESCRIPTION =
-  "File this turn's untagged reply text (written before any [[thread]] tag line) under the threads it was about. With prompts: true, file instead the user's message of this turn under these threads as well, for a message that is about them too; it shows there as sent under its own threads. When the turn holds several messages of the user's (sent while it ran), give quote for each one instead. With quote: words from an earlier message of the user's or section of your reply, from any turn, file that one under these threads as well, in its place in their history. A question's id (q3) among the threads files into its subthread, within its thread. With unfile: true and quote, take a message filed there by mistake out of these threads instead; it stays where it was sent or written. Do not repeat the text.";
+  "File this turn's untagged reply text (written before any [[thread]] tag line) under the threads it was about. With prompts: true, file instead the user's message of this turn under these threads as well, for a message that is about them too; it shows there as sent under its own threads. When the turn holds several messages of the user's (sent while it ran), give quote for each one instead. With quote: words from one block of this turn's untagged text, file that block alone; or words from an earlier message of the user's or section of your reply, from any turn, file that one under these threads as well, in its place in their history. A question's id (q3) among the threads files into its subthread, within its thread. With unfile: true and quote, take a message filed there by mistake out of these threads instead; it stays where it was sent or written. Do not repeat the text.";
 
 const strings = (value: unknown): string[] | undefined =>
   Array.isArray(value)
@@ -199,13 +236,13 @@ async function save($: EngineInterface) {
   if (!keeping.isStale) return;
   keeping.isStale = false;
   const id = await sessionIdOf($);
-  const b = await read($, book);
+  const b = await look($, book);
   // The store is one file of every session's book, held to 4 MiB in all: when this book does not fit,
   // the books of the sessions started longest ago make room for it, one at a time.
   for (;;) {
     try {
       await $.store.set(`book:${id}`, b);
-      return;
+      break;
     } catch (error) {
       const index = ((await $.store.get(INDEX)) ?? {}) as Record<
         string,
@@ -220,6 +257,11 @@ async function save($: EngineInterface) {
       await $.store.set(INDEX, rest);
     }
   }
+  // The index lists every session with a book, so that a month's sweep and a full store find it: the
+  // session after /clear has no session.start to list it.
+  const index = ((await $.store.get(INDEX)) ?? {}) as Record<string, number>;
+  if (!(id in index))
+    await $.store.set(INDEX, { ...index, [id]: await $.clock.now() });
 }
 
 function markStale($: EngineInterface) {
@@ -235,10 +277,25 @@ async function change(
   fn: (b: Book, now: number) => Book,
 ): Promise<Book> {
   const now = await $.clock.now();
-  const b = await update($, book, (b) => fn(b, now));
+  const b = await track($, book, (b) => datedMain(fn(b, now), now));
   markStale($);
   return b;
 }
+
+// The book's initial value is made before any clock, so its main is undated (0) until a hook dates it:
+// restore at session.start, or the first change of a session that had none, such as the one after
+// /clear.
+const datedMain = (b: Book, now: number): Book =>
+  b.threads.some((t) => t.id === MAIN && t.createdAt === 0)
+    ? {
+        ...b,
+        threads: b.threads.map((t) =>
+          t.id === MAIN && t.createdAt === 0
+            ? { ...t, createdAt: now, updatedAt: t.updatedAt || now }
+            : t,
+        ),
+      }
+    : b;
 
 async function apply(
   $: EngineInterface,
@@ -256,23 +313,18 @@ async function apply(
 async function restore($: EngineInterface) {
   const id = await sessionIdOf($);
   const now = await $.clock.now();
-  const current = await read($, book);
+  const current = await look($, book);
   const isFresh = current.turn.n === 0 && current.threads.length === 1;
   const stored = (await $.store.get(`book:${id}`)) as
     Parameters<typeof readBook>[0] | undefined;
   // A book in the store or in the state, in any shape either may hold, reads in Book's shapes.
   if (isFresh && stored && Array.isArray(stored.threads))
-    await update($, book, () => readBook(stored));
-  // The book's initial value is made before any clock: date a fresh session's main by its start.
+    await track($, book, () => readBook(stored));
+  // A fresh session's main is dated by its start.
   else if (isFresh && current.threads[0].createdAt === 0)
-    await update($, book, (b) => ({
-      ...b,
-      threads: b.threads.map((t) =>
-        t.createdAt === 0 ? { ...t, createdAt: now, updatedAt: now } : t,
-      ),
-    }));
+    await track($, book, (b) => datedMain(b, now));
   else {
-    await update($, book, (b) => readBook(b));
+    await track($, book, (b) => readBook(b));
     // Updated code that loads again finds the book in the state; the pending write went with the code
     // that unloaded.
     if (!isFresh) markStale($);
@@ -346,15 +398,21 @@ const fit = (text: string, width: number) =>
     ? text.padEnd(width)
     : `${text.slice(0, Math.max(0, width - 1))}…`;
 
-const ago = (now: number, at: number) => {
+// How long ago `at` was, in at most 4 cells: now, 59m, 48h, 999d, then years. An undated time (0, the
+// book's initial main) draws nothing.
+export const ago = (now: number, at: number) => {
+  if (!(at > 0)) return "";
   const m = Math.max(0, Math.round((now - at) / 60_000));
+  const d = Math.round(m / 1440);
   return m < 1
     ? "now"
     : m < 60
       ? `${m}m`
       : m < 48 * 60
         ? `${Math.round(m / 60)}h`
-        : `${Math.round(m / 1440)}d`;
+        : d < 1000
+          ? `${d}d`
+          : `${Math.min(999, Math.round(d / 365))}y`;
 };
 
 // Shows a thread at its first unread message, under the Unread line, or at its latest when it has none: a
@@ -371,16 +429,16 @@ function isAboveFold(b: Book, v: View, t: Thread): boolean {
 // A thread Claude closes while the view shows it stays in the view, its row above the fold, until
 // the user leaves it.
 async function keepClosedInView($: EngineInterface, id: string | undefined) {
-  const [v, b] = await Promise.all([read($, view), read($, book)]);
+  const [v, b] = await Promise.all([look($, view), look($, book)]);
   if (id === undefined || v.selected !== id) return;
   if (threadOf(b, id)?.status === "closed")
-    await update($, view, (w) => ({ ...w, keptUp: id }));
+    await track($, view, (w) => ({ ...w, keptUp: id }));
 }
 
 // The view shows only a thread whose row the list shows: a closed one in the fold only while the
 // fold is open. Folding the fold with a read closed thread open leaves the view.
 async function hideFolded($: EngineInterface) {
-  const [v, b] = await Promise.all([read($, view), read($, book)]);
+  const [v, b] = await Promise.all([look($, view), look($, book)]);
   const t = v.selected === null ? undefined : threadOf(b, v.selected);
   if (t !== undefined && !isAboveFold(b, v, t) && !v.showClosed)
     await select($, null);
@@ -393,11 +451,11 @@ async function select(
   anchor?: number,
   move?: Move,
 ) {
-  const was = await read($, view);
+  const was = await look($, view);
   // The field points back at the new view's own thread, keeping what was typed as the note it was for.
   await keepTyped($, was);
   const left = was.question ?? was.selected;
-  const b = await read($, book);
+  const b = await look($, book);
   const parent = id === null ? undefined : threadOf(b, id);
   const q =
     question === undefined || id === null
@@ -425,7 +483,7 @@ async function select(
     details: false,
     toUnread: first !== undefined || anchor !== undefined ? true : undefined,
   }));
-  await update($, view, (v) => ({
+  await track($, view, (v) => ({
     ...v,
     ...travelled(v, { selected: id, question: q?.id }, move),
     // A closed thread in the fold has its row in the list only while the fold is open, so opening
@@ -495,7 +553,7 @@ const travelled = (
 
 // Goes Back or Forward in the pane's history, when there is a place that way.
 async function travel($: EngineInterface, move: Move) {
-  const v = await read($, view);
+  const v = await look($, view);
   const to = (move === "back" ? v.back : v.forward)?.at(-1);
   if (to !== undefined)
     await select($, to.selected, to.question, undefined, move);
@@ -602,8 +660,8 @@ async function keepTyped($: EngineInterface, v: View) {
 // does.
 async function noteIn($: EngineInterface, q: Question) {
   // What was typed for the question it was pointed at is kept, whichever card's ✎ moves it.
-  await keepTyped($, await read($, view));
-  const v = await update($, view, (w) => ({
+  await keepTyped($, await look($, view));
+  const v = await track($, view, (w) => ({
     ...w,
     noteFor: w.noteFor === q.id ? undefined : q.id,
     // Pointed at, the note's field opens on the kept note; pointed back, the thread's keeps its text.
@@ -868,7 +926,7 @@ function questionCard(
 // prompt alone: the main view's card shows no Send answer, and says to send it from the prompt.
 async function answerInPrompt($: EngineInterface, q: Question) {
   const box = await $.prompt.read();
-  const has = answersIn(await read($, book), box.text).includes(q.id);
+  const has = answersIn(await look($, book), box.text).includes(q.id);
   const filled = has
     ? { isFilled: true }
     : box.text.trim() === ""
@@ -878,7 +936,7 @@ async function answerInPrompt($: EngineInterface, q: Question) {
           mode: "append",
         });
   if (filled.isFilled)
-    await update($, drafts, (all) => ({
+    await track($, drafts, (all) => ({
       ...all,
       [q.id]: {
         ...(all[q.id] ?? NO_DRAFT),
@@ -945,7 +1003,7 @@ async function autoSize($: EngineInterface) {
 }
 
 async function pick($: EngineInterface, q: Question, label: string) {
-  await update($, drafts, (all) => {
+  await track($, drafts, (all) => {
     const d = all[q.id] ?? NO_DRAFT;
     const isPicked = d.picks.includes(label);
     const picks = q.multiSelect
@@ -968,55 +1026,88 @@ async function pick($: EngineInterface, q: Question, label: string) {
 
 // Sets a question's drafted note, as the pane's field sends it.
 async function note($: EngineInterface, id: string, text: string) {
-  await update($, drafts, (all) => ({
+  await track($, drafts, (all) => ({
     ...all,
     [id]: { ...(all[id] ?? NO_DRAFT), note: text },
   }));
 }
 
 // Sends a checklist with nothing checked, beside the thread's other drafted answers.
-async function sendNone($: EngineInterface, q: Question) {
-  await update($, drafts, (all) => ({
-    ...all,
-    [q.id]: { picks: [], note: all[q.id]?.note ?? "", none: true as const },
-  }));
-  await sendAnswers($, q.thread);
+function sendNone($: EngineInterface, q: Question) {
+  const note = lastOf(drafts)?.[q.id]?.note ?? "";
+  return sendAnswers($, q.thread, {
+    [q.id]: { picks: [], note, none: true as const },
+  });
 }
 
 // Sends the thread's drafted answers as one message of the person's own, marks them sent, and clears
-// their drafts; the questions stay open until the session settles them.
-async function sendAnswers($: EngineInterface, thread: string) {
+// their drafts; the questions stay open until the session settles them. It submits before it awaits
+// anything (see submit), so it reads the book, drafts and view as the pane last drew them, with
+// `more` drafts on top. A message that does not enter takes back its marks and restores its drafts.
+async function sendAnswers(
+  $: EngineInterface,
+  thread: string,
+  more: Record<string, Draft> = {},
+) {
+  // Not drawn yet, they are read first, and the send is not vouched for as the person's.
+  if (lastOf(book) === undefined || lastOf(drafts) === undefined)
+    await Promise.all([look($, book), look($, drafts), look($, view)]);
+  const b = lastOf(book)!;
+  const v = lastOf(view);
+  const ds = { ...lastOf(drafts)!, ...more };
   // What the field holds for the question it is pointed at goes too, entered or not.
-  await keepTyped($, await read($, view));
-  const ds = await read($, drafts);
-  const message = answerMessage(await read($, book), thread, ds);
+  const typedNote = v === undefined ? undefined : typedFor(v);
+  if (v?.noteFor !== undefined && typedNote !== undefined)
+    ds[v.noteFor] = { ...(ds[v.noteFor] ?? NO_DRAFT), note: typedNote.trim() };
+  const message = answerMessage(b, thread, ds);
   if (message === undefined) return;
   const ids = message.answered.map((a) => a.id);
-  await update($, drafts, (all) =>
+  const sending = submit($, message.text, "answers", ids);
+  const before = Object.fromEntries(
+    ids.flatMap((id) => (ds[id] === undefined ? [] : [[id, ds[id]]])),
+  );
+  const wasSent = Object.fromEntries(
+    ids.map((id) => [id, questionOf(b, id)?.sent]),
+  );
+  await track($, drafts, (all) =>
     Object.fromEntries(Object.entries(all).filter(([id]) => !ids.includes(id))),
   );
   // A field pointed at a question now sent points back at the view's own thread or subthread.
-  await update($, view, (v) => ({
-    ...v,
+  await track($, view, (w) => ({
+    ...w,
     noteFor:
-      v.noteFor !== undefined && ids.includes(v.noteFor)
+      w.noteFor !== undefined && ids.includes(w.noteFor)
         ? undefined
-        : v.noteFor,
+        : w.noteFor,
   }));
   await update($, paneView, (p) => ({ ...p, lift: 0 }));
   await change($, (b, now) => markSent(b, message.answered, now));
-  await submit($, message.text, "answers", ids);
+  const drop = await sending;
+  if (drop === undefined) return;
+  await track($, drafts, (all) => ({ ...all, ...before }));
+  await change($, (b) => restoreSent(b, wasSent));
+  say(
+    $,
+    `threads: your answers were not sent (${drop}). They are drafted on their cards again: send them once more.`,
+  );
 }
 
 // Sends text as the person's own message, kept in the outbox until its prompt row is recorded, with
-// where it was sent from and the questions it answers; a prompt that does not enter (a hook's drop)
-// leaves it at once.
+// where it was sent from and the questions it answers. It resolves with the reason when the prompt
+// does not enter, and with undefined when it does.
+//
+// It calls $.prompt.submit before it awaits anything, and so must the press or Enter that sends: the
+// engine takes a plugin's submit as the person's input only while the dispatch of their gesture
+// runs, and only then lifts the Stop that an interrupt sets. A prompt that does not enter (a hook's
+// drop, or the engine's: a Stop refuses it, and an interrupt discards one queued behind the turn)
+// leaves the outbox, and the caller gives the words back.
 async function submit(
   $: EngineInterface,
   text: string,
   kind: Outgoing["kind"],
   questions: string[],
-) {
+): Promise<string | undefined> {
+  const entering = $.prompt.submit({ text, asUser: true });
   const out: Outgoing = {
     text: text.trim(),
     at: await $.clock.now(),
@@ -1024,11 +1115,64 @@ async function submit(
     questions,
   };
   await update($, outbox, (o) => [...o, out]);
-  const entered = await $.prompt.submit({ text, asUser: true });
-  if (entered.drop !== undefined)
+  const entered = await entering;
+  if (entered.drop !== undefined) {
     await update($, outbox, (o) =>
       o.filter((x) => x.at !== out.at || x.text !== out.text),
     );
+    return entered.drop;
+  }
+  // Its row may have been recorded before it reached the outbox: then the turn it started holds it.
+  if ((await look($, book)).turn.prompt?.text === out.text)
+    await unsend($, out.text);
+  return undefined;
+}
+
+// Tells the person why something they sent did not go: a toast, where the surface draws one.
+function say($: EngineInterface, text: string) {
+  try {
+    $.ui.toast(text);
+  } catch {
+    // A surface with no toasts: the words are back where the person sees them.
+  }
+}
+
+// Gives back the words of a message from the pane's field that did not enter: into that field when
+// the pane shows it empty, or else into the prompt box, and says why.
+async function giveBack(
+  $: EngineInterface,
+  target: string,
+  text: string,
+  words: string,
+  drop: string,
+) {
+  const v = await look($, view);
+  const key = fieldKey(v);
+  const isEmpty = typed?.key !== key || typed.text.trim() === "";
+  if (fieldTarget(v) === target && v.noteFor === undefined && isEmpty) {
+    const w = await track($, view, (w) => ({
+      ...w,
+      fieldGens: bumpGen(w, target),
+    }));
+    typed = { key: fieldKey(w), text: words };
+    await update($, paneView, (p) => ({
+      ...p,
+      returned: { key: fieldKey(w), text: words },
+    }));
+    say(
+      $,
+      `threads: your message was not sent (${drop}). It is back in the pane's field: send it again.`,
+    );
+    return;
+  }
+  const box = await $.prompt.read();
+  await $.prompt.fill(
+    box.text.trim() === "" ? { text } : { text: `\n${text}`, mode: "append" },
+  );
+  say(
+    $,
+    `threads: your message was not sent (${drop}). It is in the prompt box: send it again.`,
+  );
 }
 
 // The questions that messages in the outbox answer: their answers have not reached Claude yet.
@@ -1200,7 +1344,7 @@ async function listView(
   const expanded = v.expanded ?? [];
   const settledShown = v.settledShown ?? [];
   const toggle = (list: "expanded" | "settledShown", id: string) =>
-    void update($, view, (w) => {
+    void track($, view, (w) => {
       const ids = w[list] ?? [];
       return {
         ...w,
@@ -1218,7 +1362,7 @@ async function listView(
         plain
         dimColor={!isSorted}
         onPress={() =>
-          void update($, view, (w) => ({
+          void track($, view, (w) => ({
             ...w,
             sort: {
               by,
@@ -1269,9 +1413,7 @@ async function listView(
           <Text bold={isNew} dimColor={isSettled}>
             {fit(firstLine(q.text), statusShown ? rest : titleW)}
           </Text>{" "}
-          <Text dimColor>
-            {ago(now, q.askedAt).slice(0, ageW).padStart(ageW)}
-          </Text>
+          <Text dimColor>{ago(now, q.askedAt).padStart(ageW)}</Text>
         </Button>
       </Box>
     );
@@ -1326,9 +1468,7 @@ async function listView(
               // A verb cut to fit keeps its whole word's color.
               () => colorOf(statusParts(stateOf(x)).verb),
             )}
-          <Text dimColor>
-            {ago(now, x.updatedAt).slice(0, ageW).padStart(ageW)}
-          </Text>
+          <Text dimColor>{ago(now, x.updatedAt).padStart(ageW)}</Text>
         </Button>
       </Box>,
       ...(isOpen ? live.map(subRow) : []),
@@ -1366,7 +1506,7 @@ async function listView(
           key="closed"
           plain
           onPress={() =>
-            void update($, view, (v) => ({
+            void track($, view, (v) => ({
               ...v,
               showClosed: !v.showClosed,
             })).then(() => hideFolded($))
@@ -1475,7 +1615,7 @@ async function threadView(
   // Sent from the pane and not seen by Claude yet: filed where its row will be.
   const [out, ds, p] = await Promise.all([
     read($, outbox),
-    read($, drafts),
+    look($, drafts),
     read($, paneView),
   ]);
   const pending = out.filter((x) => {
@@ -1493,20 +1633,32 @@ async function threadView(
   const divider = boundary >= 0 ? boundary : undefined;
   const anchored = anchorAt >= 0 ? anchorAt : undefined;
   // Sends the person's words as their own message, filed by its prefix; a fresh field takes the next.
-  const send = async (prefix: string, words: string) => {
+  // It submits first, before it awaits anything (see submit); words that do not enter come back.
+  const send = (prefix: string, words: string) => {
     if (words.trim() === "") return;
-    await update($, paneView, (p) => ({ ...p, lift: 0, toUnread: false }));
-    await update($, view, (v) => ({
-      ...v,
-      fieldGens: bumpGen(v, fieldTarget(v)),
-    }));
     const text = `${prefix}${words.trim()}`;
-    await submit(
+    const target = fieldTarget(v);
+    const sending = submit(
       $,
       text,
       sq === undefined ? "thread" : "subthread",
       sq === undefined ? promptRefs(b, text).questions : [sq.id],
     );
+    return (async () => {
+      await update($, paneView, (p) => ({
+        ...p,
+        lift: 0,
+        toUnread: false,
+        returned: undefined,
+      }));
+      await track($, view, (w) => ({
+        ...w,
+        fieldGens: bumpGen(w, target),
+      }));
+      const drop = await sending;
+      if (drop !== undefined)
+        await giveBack($, target, text, words.trim(), drop);
+    })();
   };
   // A question counts as drafted with what the field holds for it, typed and not entered yet, so a
   // free answer typed alone can be sent: the field draws no value of its own.
@@ -1536,7 +1688,9 @@ async function threadView(
       key={fieldKey(v)}
       {...(noting !== undefined && ds[noting.id]?.note
         ? { value: ds[noting.id].note }
-        : {})}
+        : noting === undefined && p.returned?.key === fieldKey(v)
+          ? { value: p.returned.text }
+          : {})}
       onInput={(text) => {
         const key = fieldKey(v);
         const wasEmpty = typed?.key !== key || typed.text.trim() === "";
@@ -1562,7 +1716,7 @@ async function threadView(
       onSubmit={(words) =>
         void (noting !== undefined
           ? note($, noting.id, words.trim()).then(() =>
-              update($, view, (w) => ({
+              track($, view, (w) => ({
                 ...w,
                 noteFor: undefined,
               })),
@@ -2138,7 +2292,7 @@ export const register: Register = (on, options) => {
             quote: {
               type: "string",
               description:
-                "Words quoted exactly from an earlier message of the user's or section of your reply, from any turn: file that one instead. With prompts: true, only the user's messages count.",
+                "Words quoted exactly from one block of this turn's untagged text, or from an earlier message of the user's or section of your reply, from any turn: file that one instead. With prompts: true, only the user's messages count.",
             },
             unfile: {
               type: "boolean",
@@ -2172,7 +2326,7 @@ export const register: Register = (on, options) => {
 
   on("command.run", { command: "threads" }, async ($, e) => {
     const id = e.args.trim().replace(/^\[\[|\]\]$/g, "");
-    const b = await read($, book);
+    const b = await look($, book);
     if (id !== "" && threadOf(b, id) === undefined)
       return { text: `No thread [[${id}]] in this session.` };
     const opened = await openPane($, id === "" ? null : id);
@@ -2266,8 +2420,8 @@ export const register: Register = (on, options) => {
   on("prompt.submit", async ($, e0, next) => {
     if (e0.command !== undefined || e0.isMeta) return next(e0);
     const [b, ds, out] = await Promise.all([
-      read($, book),
-      read($, drafts),
+      look($, book),
+      look($, drafts),
       read($, outbox),
     ]);
     // An answer typed at the prompt takes the picks still drafted on its question's card.
@@ -2285,7 +2439,7 @@ export const register: Register = (on, options) => {
         ...answersIn(b, e0.text).filter((id) => ds[id]?.inPrompt),
       ]);
       if (done.size > 0)
-        await update($, drafts, (all) =>
+        await track($, drafts, (all) =>
           Object.fromEntries(
             Object.entries(all).filter(([id]) => !done.has(id)),
           ),
@@ -2330,7 +2484,7 @@ export const register: Register = (on, options) => {
     await save($).catch(() => undefined);
     if (result.block !== undefined || e.stop_hook_active) return result;
     const pending = awaited(await read($, outbox));
-    const problem = await read($, book).then(
+    const problem = await look($, book).then(
       (b) => stopProblems(b, pending),
       () => undefined,
     );
@@ -2344,7 +2498,7 @@ export const register: Register = (on, options) => {
     const shown = displayText(text);
     // A reply with tag lines draws its text here, the tags as links to the section in each thread; a
     // summary of a reply keeps the engine's drawing, which marks it so, with the tags as plain markers.
-    const b0 = await read($, book);
+    const b0 = await look($, book);
     // The threads whose sections of the reply are unread: marked on their tags, or, for one the reply
     // names by no tag (or a summary's), in a row below it.
     const unread = (
@@ -2393,7 +2547,7 @@ export const register: Register = (on, options) => {
                     if (to === undefined) return;
                     void (async () => {
                       const target = sectionTarget(
-                        await read($, book),
+                        await look($, book),
                         e.requestId,
                         text,
                         to.section,
@@ -2466,7 +2620,7 @@ export const register: Register = (on, options) => {
     // The question by the id its result names, or else the latest one asked with the call's words.
     const q = await (async () => {
       if (e.props.tool !== TOOL.ask) return undefined;
-      const b = await read($, book);
+      const b = await look($, book);
       const id = /(?:Asked|Revised) (q\d+) in/.exec(
         JSON.stringify(e.props.output ?? ""),
       )?.[1];
@@ -2515,7 +2669,7 @@ export const register: Register = (on, options) => {
           </Text>
         </Box>
       );
-    const ds = await read($, drafts);
+    const ds = await look($, drafts);
     return (
       <Box flexDirection="column" paddingLeft={2}>
         <Box flexDirection="row">
@@ -2555,8 +2709,8 @@ export const register: Register = (on, options) => {
   // has open.
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     if (!showsBand || e.props.hasSurvey) return next(e);
-    const b = await read($, book);
-    const v = await read($, view);
+    const b = await look($, book);
+    const v = await look($, view);
     const waiting = waitingOn(b);
     const byThread = new Map<string, Question[]>();
     for (const q of waiting)
@@ -2616,7 +2770,7 @@ export const register: Register = (on, options) => {
         plain
         dimColor
         onPress={() =>
-          void update($, view, (v) => ({ ...v, bandFolded: !folded }))
+          void track($, view, (v) => ({ ...v, bandFolded: !folded }))
         }
       >
         {folded ? "▸ list" : "▾ one line"}
@@ -2715,8 +2869,8 @@ export const register: Register = (on, options) => {
   on("ui.render", { component: "Pane", requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e);
     const [b, v, now] = await Promise.all([
-      read($, book),
-      read($, view),
+      look($, book),
+      look($, view),
       $.clock.now(),
     ]);
     const t0 = v.selected === null ? undefined : threadOf(b, v.selected);
@@ -2820,7 +2974,7 @@ export const register: Register = (on, options) => {
     "ui.scroll",
     { component: "Pane", requestId: PANE },
     async ($, e, next) => {
-      const [v, p] = await Promise.all([read($, view), read($, paneView)]);
+      const [v, p] = await Promise.all([look($, view), read($, paneView)]);
       if (!layout.docked) {
         if (v.selected === null || !foot.pinned) return next(e);
       } else if (

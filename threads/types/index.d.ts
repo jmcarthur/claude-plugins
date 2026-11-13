@@ -209,6 +209,9 @@ export type PaneView = {
   // The key of the field while what is typed in it for a question's note, not entered yet, is not empty:
   // written as it fills or empties, so the pane redraws whether the question can be sent.
   typing?: string;
+  // A message from the field that did not enter, given back: the key of the field that holds it again,
+  // and its words.
+  returned?: { key: string; text: string };
 };
 
 // How the docked pane splits between the list of threads above and the open thread's view below.

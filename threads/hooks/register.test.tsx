@@ -1,7 +1,7 @@
 import type { On } from "claude-code";
 import { expect, mock, test, type TestBody } from "claude-code/testing";
 
-import { cardRows, focusables } from "./register";
+import { ago, cardRows, focusables } from "./register";
 
 type Dollar = Parameters<TestBody>[0];
 
@@ -17,8 +17,18 @@ function world(on: On) {
     focusAsked: [] as string[],
     // While set, a prompt is dropped, as a hook below may drop it.
     isDropping: false,
+    // As Claude Code 2.1.323 does: while a turn runs, a plugin's prompt waits in the queue, its submit
+    // unsettled; an interrupt discards it and sets a Stop, which refuses a plugin's prompt until the
+    // person sends input. A plugin's submit counts as theirs while their press or Enter is dispatched.
+    isRunning: false,
+    isStopped: false,
+    inGesture: false,
+    queued: [] as (() => void)[],
+    toasts: [] as string[],
     // While set, the store refuses a write that would take it past this many characters of JSON.
     storeLimit: undefined as number | undefined,
+    // The session's id: a /clear goes on under a new one.
+    sessionId: ID,
   };
   on("store.get", async ($, e) => ({ value: store.get(e.key) }) as never);
   on("store.set", async ($, e) => {
@@ -36,7 +46,7 @@ function world(on: On) {
     return { value: undefined } as never;
   });
   on("session.start", async ($, e) => ({ cwd: e.cwd }));
-  on("session.id", async () => ({ value: ID }));
+  on("session.id", async () => ({ value: seen.sessionId }));
   on("tool.register", async ($, e) => ({ value: { tool: e.name } }) as never);
   on(
     "command.register",
@@ -49,8 +59,36 @@ function world(on: On) {
   });
   on("prompt.submit", async ($, e) => {
     if (seen.isDropping) return { drop: "Not now." } as never;
+    const isPersons = e.origin?.kind === "composer" || seen.inGesture;
+    if (seen.isStopped && !isPersons)
+      return {
+        drop: "the session was stopped and nobody has sent input since",
+      } as never;
+    seen.isStopped = false;
+    if (seen.isRunning && e.origin?.kind !== "composer")
+      return new Promise((resolve) =>
+        seen.queued.push(() =>
+          resolve({
+            drop: "the prompt was removed from the queue before it ran",
+          } as never),
+        ),
+      );
     seen.prompts.push(e.text);
     return { text: e.text, context: e.context };
+  });
+  // The dispatch of a press or Enter ends at its handler's first wait: here, its first write of state,
+  // which every path that sends makes sooner or later.
+  on("state.set", (async (
+    $: unknown,
+    e: never,
+    next: (e: never) => unknown,
+  ) => {
+    seen.inGesture = false;
+    return next(e);
+  }) as never);
+  on("ui.toast", async ($, e) => {
+    seen.toasts.push(e.text);
+    return { value: undefined } as never;
   });
   on("classic.Stop", async () => ({}));
   on("tool.call", async () => ({ result: "ran" }) as never);
@@ -519,7 +557,7 @@ test("each prompt carries the open threads and questions for the model", async (
   const context = (entered as { context?: readonly string[] }).context ?? [];
   expect(context.join("\n")).toContain("- q1 in [[plan]]: Approve?");
   expect(context.join("\n")).toContain(
-    "The user filed this message under [[plan]].",
+    'The user filed the message that begins "[[plan]] yes" under [[plan]].',
   );
 });
 
@@ -640,6 +678,89 @@ test("the book is kept in the store under the session at each turn's end, a few 
   } as never);
   await $.session.end({ reason: "exit" } as never);
   expect(saved()).toEqual(["main", "plan", "lexer", "docs"]);
+});
+
+test("after /clear, main's age is blank until the new session's first change dates it, and the store's index lists the new session", async ($, on) => {
+  const { store, seen, clock } = world(on);
+  on("session.end", async () => ({ sessionId: ID }) as never);
+  // The engine gives the session after /clear the state's initial values, which the kit does not: here
+  // the book reads as never written until the plugin writes it again.
+  let isCleared = false;
+  on(
+    "state.get",
+    { plugin: "threads", key: "book" } as never,
+    async ($, e, next) =>
+      isCleared
+        ? ({ value: { value: undefined, version: 0 } } as never)
+        : next(e),
+  );
+  on(
+    "state.set",
+    { plugin: "threads", key: "book" } as never,
+    async ($, e, next) => {
+      if (!isCleared) return next(e);
+      isCleared = false;
+      const { ifVersion: _, ...write } = e as never as Record<string, unknown>;
+      return next(write as never);
+    },
+  );
+  await start($);
+  await $.tool.call({
+    tool: "mcp__threads__thread",
+    id: "plan",
+    title: "Plan",
+  } as never);
+  await $.session.end({ reason: "clear" } as never);
+  isCleared = true;
+  seen.sessionId = "session-2";
+  const rows = async () => {
+    const pane = await $.ui.mount(PANE);
+    const main = (await pane.find({ type: "Button", key: "t:main" }))?.text;
+    const plan = await pane.find({ type: "Button", key: "t:plan" });
+    await pane.unmount();
+    return { main: main?.trimEnd(), hasPlan: plan !== undefined };
+  };
+  // Undated, main draws no age rather than one counted from 1970.
+  expect(await rows()).toEqual({
+    main: expect.stringMatching(/main The session as a whole$/),
+    hasPlan: false,
+  });
+  await $.tool.call({
+    tool: "mcp__threads__thread",
+    id: "lexer",
+    title: "Lexer",
+  } as never);
+  await clock.advance(2 * 60_000);
+  expect((await rows()).main).toMatch(/ 2m$/);
+  await $.classic.Stop({ stop_hook_active: false } as never);
+  expect(Object.keys(store.get("sessions") as object)).toContain("session-2");
+});
+
+test("an age fits its 4 cells for any time, and an undated one draws nothing", () => {
+  const now = 1_800_000_000_000;
+  expect(ago(now, 0)).toBe("");
+  const minute = 60_000;
+  for (const back of [
+    0,
+    1,
+    59.4,
+    59.6,
+    61,
+    47.6 * 60,
+    48 * 60,
+    999.4 * 1440,
+    999.6 * 1440,
+    1e6 * 1440,
+    now / minute - 1,
+  ])
+    expect(ago(now, now - back * minute).length).toBeLessThanOrEqual(4);
+  expect([
+    ago(now, now - 5 * minute),
+    ago(now, now - 3 * 60 * minute),
+    ago(now, now - 3 * 1440 * minute),
+    ago(now, now - 2000 * 1440 * minute),
+    ago(now, 1),
+  ]).toEqual(["5m", "3h", "3d", "5y", "57y"]);
 });
 
 test("a resumed session in a new process gets its book back from the store", async ($, on) => {
@@ -2816,7 +2937,7 @@ test("a pane answer still on its way holds no stop, and the same short words ans
   expect(block).not.toContain("- q1 in [[ui]]");
 });
 
-test("a message the pane sends that a hook drops leaves the outbox at once", async ($, on) => {
+test("a message the pane sends that a hook drops comes back to its field, and the reason shows", async ($, on) => {
   const { seen } = world(on);
   await start($);
   await $.tool.call({
@@ -2831,6 +2952,83 @@ test("a message the pane sends that a hook drops leaves the outbox at once", asy
   expect(
     await pane.find({ type: "Text", text: /not seen by Claude yet/ }),
   ).toBeUndefined();
+  expect(
+    (await pane.find({ type: "Input", key: "msg:plan:2" }))?.props.value,
+  ).toBe("go ahead");
+  expect(seen.toasts.at(-1)).toContain("not sent (Not now.)");
+  // Sent again, it goes, and the field after it is empty.
+  seen.isDropping = false;
+  await pane.input({ key: "msg:plan:2", text: "go ahead" });
+  expect(seen.prompts.at(-1)).toBe("[[plan]] go ahead");
+  expect(
+    (await pane.find({ type: "Input", key: "msg:plan:3" }))?.props.value,
+  ).toBeUndefined();
+  await pane.unmount();
+});
+
+test("a pane message queued behind a turn that an interrupt discards comes back, and the next send lifts the Stop", async ($, on) => {
+  const { seen, clock } = world(on);
+  await start($);
+  await $.tool.call({
+    tool: "mcp__threads__thread",
+    id: "plan",
+    title: "Plan",
+  } as never);
+  const pane = await $.ui.mount(PANE);
+  await pane.press({ key: "t:plan" });
+  seen.isRunning = true;
+  const sending = pane.input({ key: "msg:plan:0", text: "go ahead" });
+  await clock.settle();
+  expect(seen.queued).toHaveLength(1);
+  // The person interrupts: the queued prompt is discarded, and a Stop stands.
+  seen.isRunning = false;
+  seen.isStopped = true;
+  for (const discard of seen.queued.splice(0)) discard();
+  await sending;
+  expect(
+    (await pane.find({ type: "Input", key: "msg:plan:2" }))?.props.value,
+  ).toBe("go ahead");
+  expect(seen.toasts.at(-1)).toContain("removed from the queue");
+  // Enter in the pane is the person's input: it lifts the Stop, and the message goes.
+  seen.inGesture = true;
+  await pane.input({ key: "msg:plan:2", text: "go ahead" });
+  expect(seen.prompts.at(-1)).toBe("[[plan]] go ahead");
+  expect(seen.isStopped).toBe(false);
+  await pane.unmount();
+});
+
+test("answers sent while a Stop stands go at once; dropped ones are drafted again and not marked sent", async ($, on) => {
+  const { seen } = world(on);
+  await start($);
+  await $.tool.call({
+    tool: "mcp__threads__thread",
+    id: "plan",
+    title: "Plan",
+  } as never);
+  await $.tool.call({
+    tool: "mcp__threads__ask",
+    thread: "plan",
+    question: "Which lexer?",
+    options: [{ label: "Old" }, { label: "New" }],
+  } as never);
+  const pane = await $.ui.mount(PANE);
+  await pane.press({ key: "t:plan" });
+  await pane.press({ key: "opt:q1:1" });
+  seen.isDropping = true;
+  await pane.press({ key: "send" });
+  expect(seen.toasts.at(-1)).toContain("answers were not sent (Not now.)");
+  expect((await pane.find({ type: "Button", key: "send" }))?.text).toContain(
+    "Send 1 answer",
+  );
+  // Not marked sent: the turn's end does not count it as an answer on its way.
+  const held = await $.classic.Stop({ stop_hook_active: false } as never);
+  expect(held.block ?? "").not.toContain("q1 in [[plan]]");
+  seen.isDropping = false;
+  seen.isStopped = true;
+  seen.inGesture = true;
+  await pane.press({ key: "send" });
+  expect(seen.prompts.at(-1)).toBe("[[plan]] q1: New");
+  expect(seen.isStopped).toBe(false);
   await pane.unmount();
 });
 

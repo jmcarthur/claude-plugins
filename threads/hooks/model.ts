@@ -635,6 +635,20 @@ export const markSent = (book: Book, answered: Sent[], now: number): Book => ({
   }),
 });
 
+// Puts back what each question's `sent` was before a message that did not enter marked it.
+export const restoreSent = (
+  book: Book,
+  was: Record<string, Question["sent"]>,
+): Book => ({
+  ...book,
+  questions: book.questions.map((q) => {
+    if (!(q.id in was)) return q;
+    const { sent: _, ...rest } = q;
+    const before = was[q.id];
+    return before === undefined ? rest : { ...rest, sent: before };
+  }),
+});
+
 // How an answered question reads back: the options picked, and the words beside them. An answer sent
 // from the pane keeps its picks and note; one typed at the prompt shows the options its answer names,
 // and the answer as Claude settled it.
@@ -1504,26 +1518,72 @@ export const fileUntagged = (
 ): Outcome => {
   const refused = idsRefusal(book, ids);
   if (refused !== undefined) return refused;
+  if (quote !== undefined && !prompts) {
+    const hit = findUntagged(book, quote);
+    if ("refusal" in hit) return { book, isError: true, message: hit.refusal };
+    if (hit.piece !== undefined) return fileBlocks(book, ids, [hit.piece], now);
+  }
   if (quote !== undefined) return fileEarlier(book, ids, quote, now, prompts);
   if (prompts) return filePrompts(book, ids, now);
   if (book.turn.untagged.length === 0)
     return { book, message: "This turn has no untagged text to file." };
+  return fileBlocks(book, ids, book.turn.untagged, now);
+};
+
+// The one block of this turn's untagged text that holds the quoted words, the refusal when several do,
+// or neither when none does, for the quote to look among filed messages instead.
+const findUntagged = (
+  book: Book,
+  quote: string,
+): { piece?: Piece } | { refusal: string } => {
+  const words = squash(quote);
+  if (words === "") return {};
+  const matches = book.turn.untagged.filter((p) =>
+    squash(p.text).includes(words),
+  );
+  if (matches.length > 1)
+    return {
+      refusal: `${matches.length} blocks of this turn's untagged text hold "${quote}". Quote more of the one you mean:\n${matches
+        .slice(0, 5)
+        .map((p) => `- ${clipLine(p.text.replace(/\s+/g, " "), 80)}`)
+        .join("\n")}`,
+    };
+  return { piece: matches[0] };
+};
+
+// Files blocks of this turn's untagged text under threads as one reply section, and takes them out of
+// the untagged text. Once none is left, the turn's later replies go under these threads too.
+const fileBlocks = (
+  book: Book,
+  ids: string[],
+  pieces: Piece[],
+  now: number,
+): Outcome => {
   let b = file(
     book,
     ids,
     {
       kind: "reply",
-      text: book.turn.untagged.map((p) => p.text).join("\n\n"),
-      uuid: book.turn.untagged.find((p) => p.uuid)?.uuid,
-      at: now,
+      text: pieces.map((p) => p.text).join("\n\n"),
+      uuid: pieces.find((p) => p.uuid)?.uuid,
+      at: pieces.length === 1 ? pieces[0].at : now,
     },
     now,
   );
-  b = { ...b, turn: { ...b.turn, untagged: [], active: ids } };
-  return {
-    book: b,
-    message: `Filed under ${tagList(ids)}.`,
+  const untagged = book.turn.untagged.filter((p) => !pieces.includes(p));
+  b = {
+    ...b,
+    turn: {
+      ...b.turn,
+      untagged,
+      ...(untagged.length === 0 ? { active: ids } : {}),
+    },
   };
+  const left =
+    untagged.length === 0
+      ? ""
+      : ` ${untagged.length} more ${untagged.length === 1 ? "block is" : "blocks are"} still untagged.`;
+  return { book: b, message: `Filed under ${tagList(ids)}.${left}` };
 };
 
 export type ThreadArgs = {
@@ -1892,17 +1952,20 @@ export const promptContext = (
         }`,
       );
   }
+  // The message is named by its opening words: Claude Code can send several prompts as one user
+  // message (one an interrupt cut off, then the next), with only the last one's context.
+  const named = `The message that begins "${clipLine(prompt.trim().replace(/\s+/g, " "), 40).replace(/ …$/, "…")}"`;
   if (isPersons)
     lines.push(
       `${
         refs.threads.length > 0
-          ? `The user filed this message under ${tagList(refs.threads)}.`
-          : "This message has no tag, so it is filed under [[main]] alone."
+          ? `The user filed ${named.replace(/^The/, "the")} under ${tagList(refs.threads)}.`
+          : `${named} has no tag, so it is filed under [[main]] alone.`
       } If it is about other threads too, file it there as well (mcp__threads__file with prompts: true; with quote and words from it, when the turn holds other messages of the user's or for an earlier one).`,
     );
   if (refs.questions.length > 0)
     lines.push(
-      `It answers ${refs.questions.join(", ")}, each on its line: settle each with that answer, unless the answer asks for more. An answer may be one the user proposed rather than one of the options. Where it asks about the question instead, or proposes something you need to work out with them first, answer it, then revise the question with mcp__threads__ask revise: ${refs.questions.join(" or ")}, so that it says what you clarified, with their proposal among its options, and waits on the user again.`,
+      `${named} answers ${refs.questions.join(", ")}, each on its line: settle each with that answer, unless the answer asks for more. An answer may be one the user proposed rather than one of the options. Where it asks about the question instead, or proposes something you need to work out with them first, answer it, then revise the question with mcp__threads__ask revise: ${refs.questions.join(" or ")}, so that it says what you clarified, with their proposal among its options, and waits on the user again.`,
     );
   lines.push(
     "Before you go on, settle (mcp__threads__settle) each question this message answers or makes moot, and close (mcp__threads__thread) each thread that is done; when there is none, go on.",
@@ -1946,7 +2009,7 @@ export const stopProblems = (
       return `- “${clipLine(line, 80)}”`;
     });
     problems.push(
-      `Your reply text this turn has ${quoted.length === 1 ? "this block" : "these blocks"} before any [[thread]] tag line, so no thread holds ${quoted.length === 1 ? "it" : "them"}:\n${quoted.join("\n")}\nOnly tag lines in reply text count: a tag in your thinking, or a section you planned but did not write, files nothing. Call mcp__threads__file with the threads this text was about. If a section you meant to write is not among the quoted text, write it now under its tag. From now on, start every reply with a tag line.`,
+      `Your reply text this turn has ${quoted.length === 1 ? "this block" : "these blocks"} before any [[thread]] tag line, so no thread holds ${quoted.length === 1 ? "it" : "them"}:\n${quoted.join("\n")}\nOnly tag lines in reply text count: a tag in your thinking, or a section you planned but did not write, files nothing. Call mcp__threads__file with the threads this text was about and no quote to file it all there${quoted.length === 1 ? "" : ", or, to file a block alone, with quote: its opening words"}. If a section you meant to write is not among the quoted text, write it now under its tag. From now on, start every reply with a tag line.`,
     );
   }
   const untitled = book.threads.filter(

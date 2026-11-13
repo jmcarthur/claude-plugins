@@ -126,6 +126,20 @@ npx prettier --check .
   generation per target. A note's moves on each time the field is pointed at it;
   a thread's or subthread's only when its field sends, so pointing at a question
   and back returns to the thread's key, with what was typed there.
+- How the engine treats a plugin's `$.prompt.submit` after an interrupt, checked
+  on Claude Code 2.1.323; its declarations do not say it.
+  - Interrupting a turn (Esc or Ctrl+C) sets a Stop for the session and discards
+    every plugin prompt queued behind the turn. A queued `$.prompt.submit` then
+    settles with a drop, and nothing shows it to the person. A typed prompt
+    queued the same way goes back into the prompt box.
+  - While the Stop stands, every plugin submit is dropped at once. A typed
+    prompt lifts it, and so does a plugin submit made while the person's press
+    or Enter is still dispatched.
+  - That dispatch ends at the handler's first wait. So the pane calls
+    `$.prompt.submit` before it awaits anything (`submit`, the field's `send`,
+    `sendAnswers`), building the message from what it last drew. Words that do
+    not enter go back into their field, or the prompt box, with a toast. The
+    register tests' fake engine models the Stop and the queue.
 - An optional live check, `python3 -I threads/tests/live/pane_focus.py`, runs a
   real Claude Code session on a small model in tmux and checks that the pane's
   field keeps the keyboard while questions are filed above it. It spends usage
@@ -138,3 +152,10 @@ npx prettier --check .
     the transcript and checks that each opens the pane there, then ← and →.
   - `--split` drags the divider between the list and the thread by mouse, and
     presses its round auto-size button.
+- The README's GIF in `threads/docs/media/` comes from
+  `python3 -I threads/docs/media/record.py`. It runs a real Claude Code session
+  in kitty on a virtual X display (Xvfb) on a copy of
+  `threads/docs/media/project/`, types the request, and works the pane with the
+  mouse while ffmpeg records it. It spends usage, and Claude's replies differ
+  from run to run, so look at each frame before keeping a take. Record again
+  after a change to how the pane draws.

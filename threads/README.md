@@ -5,6 +5,8 @@ part of its replies under a thread, and a pane beside the chat shows every
 thread with its history and the questions waiting on you, so you can come back
 after being away and pick up any of them without scrolling the transcript.
 
+![Claude splits a reply into two threads and asks a question in one. A click on the question's row opens its thread, a click picks the recommended option, and Send answers it.](docs/media/demo.gif)
+
 ## Install
 
 ```

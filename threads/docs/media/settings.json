@@ -1,0 +1,26 @@
+{
+  "tui": "fullscreen",
+  "alwaysThinkingEnabled": false,
+  "promptSuggestionEnabled": false,
+  "spinnerTipsEnabled": false,
+  "autoMemoryEnabled": false,
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "mcp__threads__thread",
+      "mcp__threads__ask",
+      "mcp__threads__file",
+      "mcp__threads__settle",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(sed:*)",
+      "Bash(wc:*)",
+      "Bash(git:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)"
+    ],
+    "deny": ["Bash(pip:*)", "Bash(pip3:*)", "Bash(uv:*)", "Bash(pipx:*)"]
+  }
+}
